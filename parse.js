@@ -467,7 +467,7 @@ function tryFormLink(src, closeIdx, opener, nodes, refs, inLink) {
   const convertAutos = (list) => {
     for (let x = 0; x < list.length; x++) {
       const nd = list[x];
-      if (nd.k === 'auto' && !nd.angle) list[x] = { k: 'text', s: nd.s, raw: true };
+      if (nd.k === 'auto' && !nd.angle) list[x] = { k: 'text', s: nd.s };
       else if (nd.kids) convertAutos(nd.kids);
     }
   };
@@ -1788,7 +1788,25 @@ function innerEndsWithParagraph(inner) {
       para = true;
     }
   }
-  return para && !inFence;
+  if (!para || inFence) return false;
+  // A fence opened in an earlier blank-separated segment still swallows
+  // the tail of the inner text: veto laziness while it is unclosed.
+  let open = false;
+  let oCh = '';
+  let oLen = 0;
+  for (const ln of lines) {
+    if (open) {
+      if (isFenceClose(ln, oCh, oLen)) open = false;
+    } else {
+      const f = matchFenceStart(ln);
+      if (f) {
+        open = true;
+        oCh = f.ch;
+        oLen = f.len;
+      }
+    }
+  }
+  return !open;
 }
 
 function collectQuote(lines, i, refs) {
