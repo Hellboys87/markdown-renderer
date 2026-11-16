@@ -354,97 +354,518 @@ function tryFormLink(src, closeIdx, opener, nodes, refs) {
   for (let i = 0; i < kids.length; i++) {
     if (kids[i].k === 'auto') kids[i] = { k: 'text', s: kids[i].s, raw: true };
   }
-  processEmphasis(kids);
+  const labelCtx = makeInlineCtx(labelRaw, refs);
+  labelCtx.base = opener.start;
+  processInlineMarked(kids, labelCtx);
   return { end, node: { k: 'link', href, title, img: opener.img, kids } };
 }
 
-/** The delimiter-stack emphasis pass (CommonMark's algorithm), over a node list in place. */
-function processEmphasis(nodes, bottomIdx = -1) {
-  // Index of delimiter nodes in order.
-  let closerIdx = findDelim(nodes, bottomIdx);
-  while (closerIdx !== -1) {
-    const closer = nodes[closerIdx];
-    if (closer.ch === '~' || !closer.close || closer.n === 0) {
-      closerIdx = findDelim(nodes, closerIdx);
-      continue;
-    }
-    // Find the nearest earlier opener of the same character.
-    let openerIdx = closerIdx - 1;
-    let opener = null;
-    while (openerIdx > bottomIdx) {
-      const cand = nodes[openerIdx];
-      if (cand.k === 'delim' && cand.ch === closer.ch && cand.open && cand.n > 0) {
-        // Rule of three.
-        if (
-          (cand.close || closer.open) &&
-          (cand.n + closer.n) % 3 === 0 &&
-          cand.n % 3 !== 0 &&
-          closer.n % 3 !== 0
-        ) {
-          openerIdx--;
-          continue;
-        }
-        opener = cand;
-        break;
-      }
-      openerIdx--;
-    }
-    if (!opener) {
-      closerIdx = findDelim(nodes, closerIdx);
-      continue;
-    }
-    const use = opener.n >= 2 && closer.n >= 2 ? 2 : 1;
-    opener.n -= use;
-    closer.n -= use;
-    const inner = nodes.splice(openerIdx + 1, closerIdx - openerIdx - 1);
-    const wrap = { k: use === 2 ? 'strong' : 'em', ch: closer.ch, kids: inner };
-    nodes.splice(openerIdx + 1, 0, wrap);
-    // Adjust indices: nodes after the wrap shifted; recompute closer position.
-    closerIdx = openerIdx + 2; // position after wrap node (closer may still have n > 0)
-    if (closer.n === 0) closerIdx = findDelim(nodes, closerIdx - 1);
-    // If the opener is exhausted it stays as an inert delim with n=0; loop continues
-    // with the same closer (now at closerIdx) if it still has length.
-    if (nodes[closerIdx] !== closer) closerIdx = findDelim(nodes, closerIdx - 1);
-  }
+// ---------------------------------------------------------------------------
+// Emphasis and strikethrough pairing.
+//
+// The reference engine does not use the CommonMark delimiter-stack algorithm:
+// it scans the inline source left to right and, at each delimiter run, tries
+// to pair it with a later run of the same character using a counting scan
+// over the remaining runs. Runs are classified by their neighbours (in a
+// masked copy of the source where code spans, links, tags and reference
+// labels are blanked out): a run preceded by whitespace and followed by a
+// word character counts as an opener and adds to the balance; other runs
+// subtract. A rule-of-three check can skip a candidate closer (its length is
+// remembered and may still be consumed by a later match). The pair forms an
+// <em> when the smaller used length is odd, a <strong> when it is even, and
+// any leftover delimiter characters at the edges are reprocessed as content.
+// ---------------------------------------------------------------------------
+
+const J_CLASS_RE = /[\s\p{P}\p{S}]/u;
+const PUNCT_TEST_RE = /^(?![*_])[\s\p{P}\p{S}]/u;
+const ALNUM_RE = /[\p{L}\p{N}]/u;
+const ALT0_AST = /^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)/;
+const ALT0_UND = /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)/;
+
+/** Class of a single code point for delimiter-run classification. */
+function charClass(c) {
+  if (c === undefined || c === '') return 'end';
+  if (c === '~') return 'tilde';
+  if (/\s/.test(c)) return 'ws';
+  if (/[\p{P}\p{S}]/u.test(c)) return 'punct';
+  return 'word';
 }
 
-function findDelim(nodes, afterIdx) {
-  for (let i = afterIdx + 1; i < nodes.length; i++) {
-    if (nodes[i].k === 'delim') return i;
+/** Class of the code point at index `idx` of `str` (idx may sit mid-pair). */
+function classAt(str, idx) {
+  if (idx < 0 || idx >= str.length) return 'end';
+  let i = idx;
+  const code = str.charCodeAt(i);
+  if (code >= 0xdc00 && code <= 0xdfff && i > 0) i--;
+  return charClass(String.fromCodePoint(str.codePointAt(i)));
+}
+
+/** The code point ending just before index `idx` of `str` ('' at the start). */
+function codePointBefore(str, idx) {
+  let i = idx - 1;
+  if (i < 0) return '';
+  const code = str.charCodeAt(i);
+  if (code >= 0xdc00 && code <= 0xdfff && i > 0) {
+    const hi = str.charCodeAt(i - 1);
+    if (hi >= 0xd800 && hi <= 0xdbff) return str.slice(i - 1, idx);
+  }
+  return str[i];
+}
+
+/** Index of the ']' matching the '[' whose content starts at `from`, or -1. */
+function matchBracketIn(s, from) {
+  let depth = 1;
+  let i = from;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '`') {
+      let run = 1;
+      while (s[i + run] === '`') run++;
+      let j = i + run;
+      let closed = false;
+      while (j < s.length) {
+        if (s[j] === '`') {
+          let r2 = 1;
+          while (s[j + r2] === '`') r2++;
+          if (r2 === run) { i = j + r2; closed = true; break; }
+          j += r2;
+        } else j++;
+      }
+      if (!closed) i += run;
+      continue;
+    }
+    if (c === '[') depth++;
+    else if (c === ']') {
+      depth--;
+      if (depth === 0) return i;
+    }
+    i++;
   }
   return -1;
 }
 
 /**
- * Strikethrough pairing, reference-style: an opening run of one or two '~' pairs with the
- * next run of exactly the same length that can close; the content between is a finished
- * inline fragment. Runs before emphasis processing.
+ * Index of the ']' ending a bracketed label that contains no nested '['
+ * (code spans are skipped), or -1. Used for inline-link masking, where the
+ * reference's skip pattern does not allow nested brackets in the label.
  */
-function processDel(nodes) {
+function matchBracketFlat(s, from) {
+  let i = from;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '`') {
+      let run = 1;
+      while (s[i + run] === '`') run++;
+      let j = i + run;
+      let close = -1;
+      while (j < s.length) {
+        if (s[j] === '`') {
+          let r2 = 1;
+          while (s[j + r2] === '`') r2++;
+          if (r2 === run) { close = j; break; }
+          j += r2;
+        } else j++;
+      }
+      if (close < 0) return -1;
+      i = close + run;
+      continue;
+    }
+    if (c === '[') return -1;
+    if (c === ']') return i;
+    i++;
+  }
+  return -1;
+}
+
+/** Index of the ')' matching the '(' whose content starts at `from`, or -1. */
+function matchParenIn(s, from) {
+  let depth = 1;
+  let i = from;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '(') depth++;
+    else if (c === ')') {
+      depth--;
+      if (depth === 0) return i;
+    }
+    i++;
+  }
+  return -1;
+}
+
+/**
+ * Build the masked copy of an inline source used for delimiter scanning:
+ * code spans, inline links/images, HTML tags and autolinks are replaced by
+ * a bracketed run of "a"s of the same length, escaped punctuation becomes
+ * "++", and the label part of a resolved reference link is blanked the
+ * same way. Lengths are preserved, so positions line up with the source.
+ */
+function maskInlineString(s, refs) {
+  const a = s.split('');
+  const hide = (from, to) => {
+    if (to - from < 2) return;
+    a[from] = '[';
+    for (let x = from + 1; x < to - 1; x++) a[x] = 'a';
+    a[to - 1] = ']';
+  };
+  const n = s.length;
   let i = 0;
-  while (i < nodes.length) {
-    const open = nodes[i];
-    if (open.k !== 'delim' || open.ch !== '~' || !open.open || open.n === 0 || open.n > 2) {
+  while (i < n) {
+    const c = s[i];
+    if (c === '\\' && i + 1 < n && isPunctChar(s[i + 1])) {
+      a[i] = '+';
+      a[i + 1] = '+';
+      i += 2;
+      continue;
+    }
+    if (c === '`') {
+      let run = 1;
+      while (s[i + run] === '`') run++;
+      let j = i + run;
+      let close = -1;
+      while (j < n) {
+        if (s[j] === '`') {
+          let r2 = 1;
+          while (s[j + r2] === '`') r2++;
+          if (r2 === run) { close = j; break; }
+          j += r2;
+        } else j++;
+      }
+      if (close >= 0) {
+        hide(i, close + run);
+        i = close + run;
+        continue;
+      }
+      i += run;
+      continue;
+    }
+    if (c === '<') {
+      const m = /^<(?! )[^<>]*?>/.exec(s.slice(i));
+      if (m) {
+        hide(i, i + m[0].length);
+        i += m[0].length;
+        continue;
+      }
       i++;
       continue;
     }
-    let j = i + 1;
-    let done = false;
-    while (j < nodes.length) {
-      const close = nodes[j];
-      if (close.k === 'delim' && close.ch === '~' && close.close && close.n === open.n) {
-        const inner = nodes.splice(i + 1, j - i - 1);
-        processDel(inner);
-        processEmphasis(inner);
-        nodes.splice(i, 2, { k: 'del', kids: inner });
-        done = true;
-        break;
+    if (c === '[' || (c === '!' && s[i + 1] === '[')) {
+      const start = i;
+      const textStart = c === '!' ? i + 2 : i + 1;
+      const closeFlat = matchBracketFlat(s, textStart);
+      if (closeFlat >= 0 && s[closeFlat + 1] === '(') {
+        const closeP = matchParenIn(s, closeFlat + 2);
+        if (closeP >= 0) {
+          hide(start, closeP + 1);
+          i = closeP + 1;
+          continue;
+        }
       }
-      j++;
+      const closeB = matchBracketIn(s, textStart);
+      if (closeB >= 0) {
+        let maskedLabel = false;
+        if (s[closeB + 1] === '[') {
+          const lEnd = s.indexOf(']', closeB + 2);
+          if (lEnd >= 0) {
+            const lab = s.slice(closeB + 2, lEnd);
+            if (lab !== '' && Object.hasOwn(refs, labelKey(lab))) {
+              hide(closeB + 1, lEnd + 1);
+              maskedLabel = true;
+            }
+          }
+        } else if (Object.hasOwn(refs, labelKey(s.slice(textStart, closeB)))) {
+          hide(start, closeB + 1);
+          i = closeB + 1;
+          continue;
+        }
+        if (maskedLabel) {
+          // Only the label is hidden; the bracketed text stays scannable.
+          i = textStart;
+          continue;
+        }
+      }
+      i++;
+      continue;
     }
-    i = done ? i + 1 : i + 1;
+    i++;
+  }
+  return a.join('');
+}
+
+/**
+ * For each delimiter character, the start index of the last run in the
+ * masked source whose preceding character is not whitespace — no closer
+ * can begin after it.
+ */
+function lastCloserIndices(masked) {
+  const out = { '*': -1, '_': -1, '~': -1 };
+  const n = masked.length;
+  for (let s = 0; s < n; s++) {
+    const c = masked[s];
+    if (c !== '*' && c !== '_' && c !== '~') continue;
+    let e = s + 1;
+    while (e < n && masked[e] === c) e++;
+    const prev = s === 0 ? '\n' : masked[s - 1];
+    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
+      out[c] = s;
+    }
+    s = e - 1;
+  }
+  return out;
+}
+
+/**
+ * Classify a candidate closer run for an emphasis opener of character `r`
+ * by the classes of the characters around it: 'closer' subtracts from the
+ * balance, 'pool' adds (it acts as an opener), 'branch' subtracts but is
+ * subject to the rule-of-three skip and the same-char break, null skips it.
+ */
+function classifyEm(r, P, N) {
+  if (r === '*') {
+    if (P === 'punct' && (N === 'ws' || N === 'end')) return 'closer';
+    if ((P === 'word' || P === 'tilde') && (N === 'ws' || N === 'punct' || N === 'tilde' || N === 'end')) return 'closer';
+    if ((P === 'ws' || P === 'punct') && (N === 'word' || N === 'tilde')) return 'pool';
+    if (P === 'ws' && N === 'punct') return 'pool';
+    if (P === 'punct' && N === 'punct') return 'branch';
+    if ((P === 'word' || P === 'tilde') && N === 'word') return 'branch';
+    return null;
+  }
+  if ((P === 'punct' || P === 'tilde') && (N === 'ws' || N === 'end')) return 'closer';
+  if (P === 'word' && (N === 'ws' || N === 'punct' || N === 'tilde' || N === 'end')) return 'closer';
+  if ((P === 'ws' || P === 'punct' || P === 'tilde') && N === 'word') return 'pool';
+  if (P === 'ws' && (N === 'punct' || N === 'tilde')) return 'pool';
+  if ((P === 'punct' || P === 'tilde') && (N === 'punct' || N === 'tilde')) return 'branch';
+  return null;
+}
+
+/** Classify a candidate closer run for a strikethrough opener. */
+function classifyDel(P, N) {
+  if (P === 'punct' && (N === 'ws' || N === 'end')) return 'closer';
+  if (P === 'word' && (N === 'ws' || N === 'punct' || N === 'end')) return 'closer';
+  if ((P === 'ws' || P === 'punct') && N === 'word') return 'pool';
+  if (P === 'ws' && N === 'punct') return 'pool';
+  if (P === 'punct' && N === 'punct') return 'closer';
+  if (P === 'word' && N === 'word') return 'closer';
+  return null;
+}
+
+function makeInlineCtx(s, refs) {
+  const masked = maskInlineString(s, refs);
+  return { s, masked, last: lastCloserIndices(masked), base: 0, refs };
+}
+
+/** The last raw character of a text node (from the source when known). */
+function lastRawChar(nd, ctx) {
+  if (nd.end !== undefined) {
+    const idx = nd.end - ctx.base - 1;
+    if (idx >= 0 && idx < ctx.s.length) return ctx.s[idx];
+  }
+  return nd.s ? nd.s[nd.s.length - 1] : '';
+}
+
+/**
+ * Try to pair the '*'/'_' delimiter node at index `i` with a later run,
+ * the reference engine's way. On success the span is replaced in place and
+ * true is returned.
+ */
+function tryEmStrong(nodes, i, ctx, param) {
+  const nd = nodes[i];
+  const r = nd.ch;
+  const pos = nd.pos - ctx.base;
+  const k = nd.n;
+  const s = ctx.s;
+  const masked = ctx.masked;
+  // The character after the run decides the opening gate.
+  const F = pos + k < s.length ? s[pos + k] : undefined;
+  // Without a following punctuation or non-space character there is no
+  // opening delimiter at all.
+  if (F === undefined || /\s/.test(F)) return false;
+  let d = '';
+  let s4 = false;
+  if (F !== r) {
+    if (F !== '~' && /[\p{P}\p{S}]/u.test(F)) d = F;
+    else if (r === '_') s4 = true;
+  }
+  // The run may extend backwards into identical characters already passed.
+  let l = pos;
+  while (l > 0 && masked[l - 1] === r) l--;
+  const p = codePointBefore(masked, l);
+  const h = p !== '' && J_CLASS_RE.test(p);
+  let nParam = param;
+  if (l < pos) nParam = p;
+  const u = l < pos ? h : PUNCT_TEST_RE.test(nParam);
+  if (s4 && nParam !== '' && ALNUM_RE.test(nParam)) return false;
+  if (!(d === '' || nParam === '' || u)) return false;
+  const canClose = p.trim() !== '' && (d !== '' || (r === '*' && !h));
+  const y = pos - l + k;
+  const oBreak = param === r;
+  // A run of this character sitting inside the first opposite pair is skipped.
+  let skipPos = -1;
+  const m0 = (r === '*' ? ALT0_AST : ALT0_UND).exec(masked.slice(pos + k));
+  if (m0) {
+    const dbl = r === '*' ? '__' : '**';
+    const di = m0[0].indexOf(dbl);
+    const ri = m0[0].indexOf(r, di + 2);
+    if (ri >= 0) skipPos = pos + k + ri;
+  }
+  let m = k;
+  let f = 0;
+  const bound = ctx.last[r];
+  for (let j = i + 1; j < nodes.length; j++) {
+    const C = nodes[j];
+    if (C.k !== 'delim' || C.ch !== r || C.n === 0) continue;
+    const q = C.pos - ctx.base;
+    if (q > bound) break;
+    if (skipPos >= q && skipPos < q + C.n) continue;
+    const b = C.n;
+    const cls = classifyEm(r, classAt(masked, q - 1), classAt(masked, q + b));
+    if (cls === null) continue;
+    if (cls === 'pool') {
+      m += b;
+      continue;
+    }
+    if (cls === 'branch' || canClose) {
+      if (oBreak && cls === 'branch') return false;
+      if (y % 3 !== 0 && (y + b) % 3 === 0) {
+        f += b;
+        continue;
+      }
+    }
+    m -= b;
+    if (m > 0) continue;
+    const bUsed = Math.min(b, b + m + f);
+    const isEm = Math.min(k, bUsed) % 2 === 1;
+    const uo = isEm ? 1 : 2;
+    const kids = [];
+    if (k > uo) kids.push({ k: 'delim', ch: r, n: k - uo, pos: nd.pos + uo });
+    kids.push(...nodes.slice(i + 1, j));
+    if (bUsed > uo) kids.push({ k: 'delim', ch: r, n: bUsed - uo, pos: C.pos });
+    // The content is reprocessed as its own inline string, with its own mask.
+    const subCtx = makeInlineCtx(s.slice(pos + uo, q + bUsed - uo), ctx.refs);
+    subCtx.base = ctx.base + pos + uo;
+    processInlineMarked(kids, subCtx);
+    const repl = [{ k: isEm ? 'em' : 'strong', kids }];
+    if (b > bUsed) repl.push({ k: 'delim', ch: r, n: b - bUsed, pos: C.pos + bUsed });
+    nodes.splice(i, j - i + 1, ...repl);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Try to pair the '~' delimiter node at index `i` with a later run of the
+ * same length, the reference engine's way.
+ */
+function tryDel(nodes, i, ctx, param) {
+  const nd = nodes[i];
+  const o = nd.n;
+  if (o > 2) return false;
+  const pos = nd.pos - ctx.base;
+  const s = ctx.s;
+  const masked = ctx.masked;
+  const F = pos + o < s.length ? s[pos + o] : undefined;
+  if (F === undefined || F === '~' || /\s/.test(F)) return false;
+  const s1 = /[\p{P}\p{S}]/u.test(F) ? F : '';
+  if (!(s1 === '' || param === '' || PUNCT_TEST_RE.test(param))) return false;
+  let p = o;
+  const bound = ctx.last['~'];
+  for (let j = i + 1; j < nodes.length; j++) {
+    const C = nodes[j];
+    if (C.k !== 'delim' || C.ch !== '~' || C.n === 0) continue;
+    const q = C.pos - ctx.base;
+    if (q > bound) break;
+    if (C.n !== o) continue;
+    const cls = classifyDel(classAt(masked, q - 1), classAt(masked, q + C.n));
+    if (cls === null) continue;
+    if (cls === 'pool') {
+      p += o;
+      continue;
+    }
+    p -= o;
+    if (p > 0) continue;
+    const kids = nodes.slice(i + 1, j);
+    const subCtx = makeInlineCtx(s.slice(pos + o, q), ctx.refs);
+    subCtx.base = ctx.base + pos + o;
+    processInlineMarked(kids, subCtx);
+    nodes.splice(i, j - i + 1, { k: 'del', kids });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * One left-to-right pass over a node list pairing emphasis and
+ * strikethrough runs, tracking the "previous character" the reference
+ * engine threads through its token stream (the last character of the
+ * preceding text token, reset after any non-text token; a text token
+ * ending in '_' leaves it unchanged).
+ */
+function processInlineMarked(nodes, ctx) {
+  let prevText = false;
+  let prevChar = '';
+  let i = 0;
+  while (i < nodes.length) {
+    const nd = nodes[i];
+    if (nd.k === 'delim' && nd.n > 0 && !nd.inert && (nd.ch === '*' || nd.ch === '_')) {
+      if (tryEmStrong(nodes, i, ctx, prevText ? prevChar : '')) {
+        prevText = false;
+        i++;
+        continue;
+      }
+      if (nd.n > 1) {
+        // A failed attempt consumes one character of the run as text; the
+        // remaining characters are tried again as a fresh run.
+        nodes.splice(i, 0, { k: 'delim', ch: nd.ch, n: 1, pos: nd.pos, inert: true });
+        nd.n -= 1;
+        nd.pos += 1;
+        prevText = true;
+        if (nd.ch !== '_') prevChar = nd.ch;
+        i++;
+        continue;
+      }
+      prevText = true;
+      if (nd.ch !== '_') prevChar = nd.ch;
+      i++;
+      continue;
+    }
+    if (nd.k === 'delim' && nd.inert) {
+      prevText = true;
+      if (nd.ch !== '_') prevChar = nd.ch;
+      i++;
+      continue;
+    }
+    if (nd.k === 'delim' && nd.n > 0 && nd.ch === '~') {
+      if (tryDel(nodes, i, ctx, prevText ? prevChar : '')) {
+        prevText = false;
+        i++;
+        continue;
+      }
+      prevText = true;
+      prevChar = '~';
+      i++;
+      continue;
+    }
+    if (nd.k === 'text' && !nd.esc) {
+      prevText = true;
+      const lastCh = lastRawChar(nd, ctx);
+      if (lastCh !== '' && lastCh !== '_') prevChar = lastCh;
+      i++;
+      continue;
+    }
+    if (nd.k === 'open') {
+      prevText = true;
+      prevChar = '[';
+      i++;
+      continue;
+    }
+    prevText = false;
+    i++;
   }
 }
+
 
 /** Render a node list to HTML. `alt` renders the plain-text form used for image alt text. */
 function renderNodes(nodes, alt = false) {
@@ -537,7 +958,7 @@ function renderInline(src, refs) {
   let textBuf = '';
   const flushText = () => {
     if (textBuf.length > 0) {
-      nodes.push({ k: 'text', s: inRawBlock ? textBuf : decodeNumericRefs(textBuf), raw: inRawBlock });
+      nodes.push({ k: 'text', s: inRawBlock ? textBuf : decodeNumericRefs(textBuf), raw: inRawBlock, end: i });
       textBuf = '';
     }
   };
@@ -559,7 +980,7 @@ function renderInline(src, refs) {
       }
       if (next !== undefined && isAsciiPunct(next)) {
         flushText();
-        nodes.push({ k: 'text', s: next, raw: false });
+        nodes.push({ k: 'text', s: next, raw: false, esc: true });
         i += 2;
         continue;
       }
@@ -728,7 +1149,7 @@ function renderInline(src, refs) {
         close = !prevIsSpace && prev !== '~';
       }
       flushText();
-      nodes.push({ k: 'delim', ch, n: run, open, close });
+      nodes.push({ k: 'delim', ch, n: run, open, close, pos: i });
       i += run;
       continue;
     }
@@ -800,8 +1221,7 @@ function renderInline(src, refs) {
   }
   flushText();
 
-  processDel(nodes);
-  processEmphasis(nodes);
+  processInlineMarked(nodes, makeInlineCtx(src, refs));
   return renderNodes(nodes);
 }
 
