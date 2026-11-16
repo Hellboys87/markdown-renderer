@@ -129,6 +129,8 @@ const TAG_RE = new RegExp(
   String.raw`^(?:<!--(?:-?>|[\s\S]*?-->)|</[A-Za-z][A-Za-z0-9-]*\s*>|<[A-Za-z][A-Za-z0-9-]*(?:${TAG_ATTR})*\s*/?>|<\?[\s\S]*?\?>|<![A-Za-z]+\s[\s\S]*?>|<!\[CDATA\[[\s\S]*?\]\]>)`,
 );
 const AUTOLINK_RE = /^<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s\x00-\x1f<>]*|[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)>/;
+const AUTOLINK_RE_Y = new RegExp(AUTOLINK_RE.source.slice(1), 'y');
+const TAG_RE_Y = new RegExp(TAG_RE.source.slice(1), 'y');
 const PRE_OPEN_RE = /^<(pre|code|kbd|script)(\s|>)/i;
 const PRE_CLOSE_RE = /^<\/(pre|code|kbd|script)(\s|>)/i;
 const A_OPEN_RE = /^<a /i;
@@ -138,6 +140,9 @@ const A_CLOSE_RE = /^<\/a>/i;
 const URL_HEAD_RE = /^(?:(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.)(?:[A-Za-z0-9-]+\.?)+[^\s<]*/;
 const EMAIL_RE = /^[A-Za-z0-9._+-]+@[A-Za-z0-9-_]+(?:\.[A-Za-z0-9-_]*[A-Za-z0-9])+(?![\w-])/;
 const MAILTO_URL_RE = /^(?:mailto:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])|xmpp:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?)/;
+const URL_HEAD_RE_Y = new RegExp(URL_HEAD_RE.source.slice(1), 'y');
+const EMAIL_RE_Y = new RegExp(EMAIL_RE.source.slice(1), 'y');
+const MAILTO_URL_RE_Y = new RegExp(MAILTO_URL_RE.source.slice(1), 'y');
 
 /**
  * GFM trimming for bare URLs: the kept text is the longest prefix that
@@ -605,6 +610,9 @@ function matchParenIn(s, from) {
  * same way. Lengths are preserved, so positions line up with the source.
  */
 function maskInlineString(s, refs) {
+  // The mask only ever rewrites escapes, code spans, tags and bracketed
+  // constructs; with none of those characters present it is the identity.
+  if (!/[`[<\\]/.test(s)) return s;
   const a = s.split('');
   const hide = (from, to) => {
     if (to - from < 2) return;
@@ -754,6 +762,19 @@ function classifyDel(P, N) {
 }
 
 function makeInlineCtx(s, refs, inLink = false, state = null) {
+  // With no emphasis/strikethrough characters anywhere, no pairing scan
+  // can run, so the mask and closer table would never be consulted.
+  if (!/[*_~]/.test(s)) {
+    return {
+      s,
+      masked: s,
+      last: { '*': -1, '_': -1, '~': -1 },
+      base: 0,
+      refs,
+      inLink,
+      state: state || { inLink: false, inRawBlock: false },
+    };
+  }
   const masked = maskInlineString(s, refs);
   return {
     s,
@@ -1117,7 +1138,8 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
       let limit = n;
       if (stack.length > 0) {
         const topOpener = stack[stack.length - 1];
-        if (topOpener.labelEnd !== undefined && topOpener.labelEnd >= 0) limit = topOpener.labelEnd;
+        if (topOpener.labelEnd === undefined) topOpener.labelEnd = labelScanEnd(src, topOpener.start);
+        if (topOpener.labelEnd >= 0) limit = topOpener.labelEnd;
       }
       let j = i + run;
       let closeStart = -1;
@@ -1150,8 +1172,8 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
     }
 
     if (ch === '<') {
-      const rest = src.slice(i);
-      const auto = AUTOLINK_RE.exec(rest);
+      AUTOLINK_RE_Y.lastIndex = i;
+      const auto = AUTOLINK_RE_Y.exec(src);
       if (auto) {
         flushText();
         const text = auto[1];
@@ -1162,7 +1184,8 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
         i += auto[0].length;
         continue;
       }
-      const tag = TAG_RE.exec(rest);
+      TAG_RE_Y.lastIndex = i;
+      const tag = TAG_RE_Y.exec(src);
       if (tag) {
         flushText();
         nodes.push({ k: 'html', s: tag[0] });
@@ -1180,7 +1203,7 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
 
     if (ch === '!' && src[i + 1] === '[') {
       flushText();
-      const opener = { k: 'open', img: true, start: i + 2, nodeIndex: nodes.length, labelEnd: labelScanEnd(src, i + 2), snap: { inLink: inLinkTag, inRawBlock } };
+      const opener = { k: 'open', img: true, start: i + 2, nodeIndex: nodes.length, snap: { inLink: inLinkTag, inRawBlock } };
       nodes.push(opener);
       stack.push(opener);
       i += 2;
@@ -1189,7 +1212,7 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
 
     if (ch === '[') {
       flushText();
-      const opener = { k: 'open', img: false, start: i + 1, nodeIndex: nodes.length, labelEnd: labelScanEnd(src, i + 1), snap: { inLink: inLinkTag, inRawBlock } };
+      const opener = { k: 'open', img: false, start: i + 1, nodeIndex: nodes.length, snap: { inLink: inLinkTag, inRawBlock } };
       nodes.push(opener);
       stack.push(opener);
       i++;
@@ -1321,15 +1344,16 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
     // GFM bare autolinks: protocol URLs anywhere, www. and e-mail at word boundaries,
     // unless inside an <a> tag span.
     if (!inLink && !inLinkTag && (ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F' || ch === 'w' || ch === 'W' || ch === 'm' || ch === 'x')) {
-      const rest = src.slice(i);
-      const mail = MAILTO_URL_RE.exec(rest);
+      MAILTO_URL_RE_Y.lastIndex = i;
+      const mail = MAILTO_URL_RE_Y.exec(src);
       if (mail && (mail[0].startsWith('mailto:') || mail[0].startsWith('xmpp:'))) {
         flushText();
         nodes.push({ k: 'auto', s: mail[0], href: mail[0] });
         i += mail[0].length;
         continue;
       }
-      const url = URL_HEAD_RE.exec(rest);
+      URL_HEAD_RE_Y.lastIndex = i;
+      const url = URL_HEAD_RE_Y.exec(src);
       if (url) {
         const isWww = /^www\./.test(url[0]);
         const prev = i > 0 ? src[i - 1] : undefined;
@@ -1370,7 +1394,8 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
     if (!inLink && !inLinkTag && /[A-Za-z0-9]/.test(ch)) {
       const prev = i > 0 ? src[i - 1] : undefined;
       if (prev === undefined || !/[A-Za-z0-9._%+-]/.test(prev)) {
-        const em = EMAIL_RE.exec(src.slice(i));
+        EMAIL_RE_Y.lastIndex = i;
+        const em = EMAIL_RE_Y.exec(src);
         if (em) {
           flushText();
           nodes.push({ k: 'auto', s: em[0], href: `mailto:${em[0]}` });
@@ -1380,6 +1405,60 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
       }
     }
 
+    // Second tier: characters whose own dispatch is always the plain
+    // fallthrough (spaces, most punctuation, non-ASCII) batch together;
+    // the following character is dispatched normally, so token boundaries
+    // after them are unaffected.
+    const code0 = src.charCodeAt(i);
+    if (
+      code0 >= 128 || code0 === 32 || code0 === 9 || code0 === 34 ||
+      code0 === 35 || code0 === 36 || code0 === 38 || code0 === 39 || code0 === 40 ||
+      code0 === 41 || code0 === 44 || code0 === 47 || code0 === 58 || code0 === 59 ||
+      code0 === 61 || code0 === 62 || code0 === 63 || code0 === 64 || code0 === 94 ||
+      code0 === 123 || code0 === 124 || code0 === 125
+    ) {
+      let j = i + 1;
+      while (j < n) {
+        const c = src.charCodeAt(j);
+        if (
+          c >= 128 || c === 32 || c === 9 || c === 34 ||
+          c === 35 || c === 36 || c === 38 || c === 39 || c === 40 ||
+          c === 41 || c === 44 || c === 47 || c === 58 || c === 59 ||
+          c === 61 || c === 62 || c === 63 || c === 64 || c === 94 ||
+          c === 123 || c === 124 || c === 125
+        ) {
+          j++;
+        } else break;
+      }
+      textBuf += src.slice(i, j);
+      i = j;
+      continue;
+    }
+    // Plain text: a run of characters that cannot start a token and
+    // cannot follow a token boundary (letters/digits that never begin a
+    // URL, mail or e-mail token from inside a word) is consumed at once.
+    if (
+      (code0 >= 48 && code0 <= 57) ||
+      (code0 >= 65 && code0 <= 90 && code0 !== 72 && code0 !== 70) ||
+      (code0 >= 97 && code0 <= 122 && code0 !== 104 && code0 !== 102 && code0 !== 109 && code0 !== 120) ||
+      code0 === 46 || code0 === 37 || code0 === 43 || code0 === 45
+    ) {
+      let j = i + 1;
+      while (j < n) {
+        const c = src.charCodeAt(j);
+        if (
+          (c >= 48 && c <= 57) ||
+          (c >= 65 && c <= 90 && c !== 72 && c !== 70) ||
+          (c >= 97 && c <= 122 && c !== 104 && c !== 102 && c !== 109 && c !== 120) ||
+          c === 46 || c === 37 || c === 43 || c === 45
+        ) {
+          j++;
+        } else break;
+      }
+      textBuf += src.slice(i, j);
+      i = j;
+      continue;
+    }
     textBuf += ch;
     i++;
   }
@@ -1472,6 +1551,7 @@ const HTML_TAGNAME_RE = /^ {0,3}<\/?([A-Za-z][A-Za-z0-9-]*)/;
 
 /** Start-of-HTML-block conditions that also interrupt a paragraph (types 1-6). */
 function htmlBlockStart(line) {
+  if (!line.includes('<')) return null;
   const s = lead3(line);
   const rest = line.slice(s);
   if (rest[0] !== '<') return null;
@@ -1485,9 +1565,11 @@ function htmlBlockStart(line) {
 }
 
 /** A complete open or close tag ending the line (HTML block type 7; does not interrupt). */
+const HTML_TYPE7_OPEN_RE = new RegExp(String.raw`^<[A-Za-z][A-Za-z0-9-]*(?:${TAG_ATTR})*\s*/?>[ \t]*$`);
 function htmlType7(line) {
+  if (!line.includes('<')) return false;
   const rest = line.slice(lead3(line));
-  const open = new RegExp(String.raw`^<[A-Za-z][A-Za-z0-9-]*(?:${TAG_ATTR})*\s*/?>[ \t]*$`).exec(rest);
+  const open = HTML_TYPE7_OPEN_RE.exec(rest);
   if (open) return true;
   // A closing tag on its own line counts too, but it may not carry attributes.
   return /^<\/[A-Za-z][A-Za-z0-9-]*\s*>[ \t]*$/.test(rest);
@@ -1875,12 +1957,28 @@ function matchBullet(line) {
 }
 
 /** Block-begin tests that end a list item's continuation, at the clamped indent. */
+const beginsBlockCache = [];
+function beginsBlockRes(n) {
+  let r = beginsBlockCache[n];
+  if (!r) {
+    r = {
+      bullet: new RegExp(`^ {0,${n}}(?:[*+-]|\\d{1,9}[.)])(?:[ \\t]|$)`),
+      hr: new RegExp(`^ {0,${n}}((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})[ \\t]*$`),
+      fence: new RegExp(`^ {0,${n}}(?:\`{3,}|~{3,})`),
+      heading: new RegExp(`^ {0,${n}}#{1,6}(?:\\s|$)`),
+      quote: new RegExp(`^ {0,${n}}>`),
+    };
+    beginsBlockCache[n] = r;
+  }
+  return r;
+}
 function beginsBlock(line, n, bulletAny) {
-  if (bulletAny && new RegExp(`^ {0,${n}}(?:[*+-]|\\d{1,9}[.)])(?:[ \\t]|$)`).test(line)) return true;
-  if (new RegExp(`^ {0,${n}}((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})[ \\t]*$`).test(line)) return true;
-  if (new RegExp(`^ {0,${n}}(?:\`{3,}|~{3,})`).test(line)) return true;
-  if (new RegExp(`^ {0,${n}}#{1,6}(?:\\s|$)`).test(line)) return true;
-  if (bulletAny && new RegExp(`^ {0,${n}}>`).test(line)) return true;
+  const r = beginsBlockRes(n);
+  if (bulletAny && r.bullet.test(line)) return true;
+  if (r.hr.test(line)) return true;
+  if (r.fence.test(line)) return true;
+  if (r.heading.test(line)) return true;
+  if (bulletAny && r.quote.test(line)) return true;
   if (htmlBeginAt(line, n)) return true;
   return false;
 }
