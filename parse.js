@@ -135,7 +135,7 @@ const A_OPEN_RE = /^<a /i;
 const A_CLOSE_RE = /^<\/a>/i;
 
 // GFM extended autolinks (bare URLs and e-mail addresses in text).
-const URL_HEAD_RE = /^(?:(?:https?|ftp):\/\/|www\.)(?:[A-Za-z0-9-]+\.?)+[^\s<]*/i;
+const URL_HEAD_RE = /^(?:(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.)(?:[A-Za-z0-9-]+\.?)+[^\s<]*/;
 const EMAIL_RE = /^[A-Za-z0-9._+-]+@[A-Za-z0-9-_]+(?:\.[A-Za-z0-9-_]*[A-Za-z0-9])+(?![\w-])/;
 const MAILTO_URL_RE = /^(?:mailto:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])|xmpp:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?)/;
 
@@ -304,12 +304,84 @@ function parseRefLabel(src, pos) {
 }
 
 /**
+ * The matching ']' for a bracket group inside a link label, where the inner
+ * content allows one more nesting level but no code-span handling: returns
+ * the index just past the closing ']', or -1.
+ */
+function matchNestedLabel(s, start) {
+  let i = start + 1;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '[') {
+      let j = i + 1;
+      let ok = false;
+      while (j < s.length) {
+        const d = s[j];
+        if (d === '\\') { j += 2; continue; }
+        if (d === '[') return -1;
+        if (d === ']') { ok = true; break; }
+        j++;
+      }
+      if (!ok) return -1;
+      i = j + 1;
+      continue;
+    }
+    if (c === ']') return i + 1;
+    i++;
+  }
+  return -1;
+}
+
+/**
+ * Whether a link label can match the reference's label pattern at all:
+ * plain characters, escapes and nested bracket groups are fine; a backtick
+ * must open a run whose content holds no backticks and which is closed by
+ * another run (of any length), except that a run of two or more backticks
+ * may sit at the very end of the label. Anything else — most often an
+ * unclosed backtick — means no link or image can form here.
+ */
+function labelPatternOk(label) {
+  const n = label.length;
+  let i = 0;
+  while (i < n) {
+    const c = label[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '`') {
+      let run = 1;
+      while (label[i + run] === '`') run++;
+      if (run >= 2 && i + run === n) return true;
+      let j = i + run;
+      while (j < n && label[j] !== '`') j++;
+      if (j >= n) return false;
+      let r2 = 1;
+      while (label[j + r2] === '`') r2++;
+      i = j + r2;
+      continue;
+    }
+    if (c === '[') {
+      const end = matchNestedLabel(label, i);
+      if (end < 0) return false;
+      i = end;
+      continue;
+    }
+    if (c === ']') return false;
+    i++;
+  }
+  return true;
+}
+
+/**
  * Try to form a link or image at a ']' (position `closeIdx` in src), where `opener` is the
  * bracket node on top of the stack and `nodes` is the node list built so far (the opener is the
  * last "open" node in it). Returns { end, node } on success, null on failure.
  */
-function tryFormLink(src, closeIdx, opener, nodes, refs) {
+function tryFormLink(src, closeIdx, opener, nodes, refs, inLink) {
   const labelRaw = src.slice(opener.start, closeIdx);
+  // Inside link text, links do not form (images still do), and a label that
+  // the reference's label pattern cannot match forms nothing at all.
+  if (inLink && !opener.img) return null;
+  if (!labelPatternOk(labelRaw)) return null;
   let href = null;
   let title = null;
   let end = closeIdx + 1;
@@ -350,11 +422,17 @@ function tryFormLink(src, closeIdx, opener, nodes, refs) {
 
   const kids = nodes.splice(opener.nodeIndex + 1);
   nodes.length = opener.nodeIndex;
-  // Bare autolinks never survive inside a link or image label in the reference.
-  for (let i = 0; i < kids.length; i++) {
-    if (kids[i].k === 'auto') kids[i] = { k: 'text', s: kids[i].s, raw: true };
-  }
-  const labelCtx = makeInlineCtx(labelRaw, refs);
+  // Bare autolinks never survive inside a link or image label in the
+  // reference (angle autolinks do); the suppression applies at any depth.
+  const convertAutos = (list) => {
+    for (let x = 0; x < list.length; x++) {
+      const nd = list[x];
+      if (nd.k === 'auto' && !nd.angle) list[x] = { k: 'text', s: nd.s, raw: true };
+      else if (nd.kids) convertAutos(nd.kids);
+    }
+  };
+  convertAutos(kids);
+  const labelCtx = makeInlineCtx(labelRaw, refs, true);
   labelCtx.base = opener.start;
   processInlineMarked(kids, labelCtx);
   return { end, node: { k: 'link', href, title, img: opener.img, kids } };
@@ -652,9 +730,9 @@ function classifyDel(P, N) {
   return null;
 }
 
-function makeInlineCtx(s, refs) {
+function makeInlineCtx(s, refs, inLink = false) {
   const masked = maskInlineString(s, refs);
-  return { s, masked, last: lastCloserIndices(masked), base: 0, refs };
+  return { s, masked, last: lastCloserIndices(masked), base: 0, refs, inLink };
 }
 
 /** The last raw character of a text node (from the source when known). */
@@ -739,14 +817,12 @@ function tryEmStrong(nodes, i, ctx, param) {
     const bUsed = Math.min(b, b + m + f);
     const isEm = Math.min(k, bUsed) % 2 === 1;
     const uo = isEm ? 1 : 2;
-    const kids = [];
-    if (k > uo) kids.push({ k: 'delim', ch: r, n: k - uo, pos: nd.pos + uo });
-    kids.push(...nodes.slice(i + 1, j));
-    if (bUsed > uo) kids.push({ k: 'delim', ch: r, n: bUsed - uo, pos: C.pos });
-    // The content is reprocessed as its own inline string, with its own mask.
-    const subCtx = makeInlineCtx(s.slice(pos + uo, q + bUsed - uo), ctx.refs);
-    subCtx.base = ctx.base + pos + uo;
-    processInlineMarked(kids, subCtx);
+    // The content is re-lexed as its own inline string: tokens whose match
+    // depends on the following character (bare autolinks, e-mail addresses)
+    // resolve against the content's end, not the outer text.
+    const contentStr = s.slice(pos + uo, q + bUsed - uo);
+    const kids = scanInline(contentStr, ctx.refs, ctx.inLink);
+    processInlineMarked(kids, makeInlineCtx(contentStr, ctx.refs, ctx.inLink));
     const repl = [{ k: isEm ? 'em' : 'strong', kids }];
     if (b > bUsed) repl.push({ k: 'delim', ch: r, n: b - bUsed, pos: C.pos + bUsed });
     nodes.splice(i, j - i + 1, ...repl);
@@ -786,10 +862,9 @@ function tryDel(nodes, i, ctx, param) {
     }
     p -= o;
     if (p > 0) continue;
-    const kids = nodes.slice(i + 1, j);
-    const subCtx = makeInlineCtx(s.slice(pos + o, q), ctx.refs);
-    subCtx.base = ctx.base + pos + o;
-    processInlineMarked(kids, subCtx);
+    const contentStr = s.slice(pos + o, q);
+    const kids = scanInline(contentStr, ctx.refs, ctx.inLink);
+    processInlineMarked(kids, makeInlineCtx(contentStr, ctx.refs, ctx.inLink));
     nodes.splice(i, j - i + 1, { k: 'del', kids });
     return true;
   }
@@ -946,11 +1021,12 @@ function renderNodes(nodes, alt = false) {
 }
 
 /**
- * Tokenise + process an inline fragment. `refs` is the document's link-reference map.
- * When `inLinkText` is set (inside an <a> tag's span or a link label being re-parsed) bare
- * autolinks are suppressed the way the reference suppresses them.
+ * Tokenise an inline fragment into a node list. `refs` is the document's
+ * link-reference map. When `inLink` is set (a link label's own parse), bare
+ * autolinks are suppressed and links do not form, the way the reference
+ * suppresses them inside link text.
  */
-function renderInline(src, refs) {
+function scanInline(src, refs, inLink) {
   const nodes = [];
   const stack = []; // indices into `nodes` of bracket openers still unmatched
   let inRawBlock = false;
@@ -1032,7 +1108,7 @@ function renderInline(src, refs) {
         const href = text.includes('@') && !text.includes(':') ? `mailto:${text}` : text;
         // Scheme autolinks keep their text; e-mail autolinks get mailto:.
         const isEmail = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@/.test(text);
-        nodes.push({ k: 'auto', s: text, href: isEmail ? `mailto:${text}` : text });
+        nodes.push({ k: 'auto', s: text, href: isEmail ? `mailto:${text}` : text, angle: true });
         i += auto[0].length;
         continue;
       }
@@ -1088,18 +1164,11 @@ function renderInline(src, refs) {
         i++;
         continue;
       }
-      if (opener.dead) {
-        // An inactive opener: this ']' is literal, and the opener leaves the stack.
-        stack.pop();
-        opener.k = 'text';
-        opener.s = opener.img ? '![' : '[';
-        delete opener.img;
-        textBuf += ']';
-        i++;
-        continue;
+      let formed = null;
+      if (!opener.dead) {
+        flushText();
+        formed = tryFormLink(src, i, opener, nodes, refs, inLink);
       }
-      flushText();
-      const formed = tryFormLink(src, i, opener, nodes, refs);
       if (formed) {
         stack.pop();
         nodes.push(formed.node);
@@ -1111,6 +1180,23 @@ function renderInline(src, refs) {
           }
         }
         i = formed.end;
+        continue;
+      }
+      // No link forms here. A bare URL that was cut short at this ']' gets
+      // its full length back, swallowing the ']' as the reference's URL
+      // tokeniser would.
+      const lastNode = nodes[nodes.length - 1];
+      if (lastNode && lastNode.k === 'auto' && lastNode.trunc === i && textBuf === '') {
+        const m2 = URL_HEAD_RE.exec(src.slice(lastNode.pos));
+        const full = backpedalUrl(m2[0]);
+        lastNode.s = full;
+        lastNode.href = /^www\./.test(m2[0]) ? `http://${full}` : full;
+        delete lastNode.trunc;
+        stack.pop();
+        opener.k = 'text';
+        opener.s = opener.img ? '![' : '[';
+        delete opener.img;
+        i = lastNode.pos + full.length;
         continue;
       }
       // No link: the opener is consumed as literal text, ']' is literal too.
@@ -1179,7 +1265,7 @@ function renderInline(src, refs) {
 
     // GFM bare autolinks: protocol URLs anywhere, www. and e-mail at word boundaries,
     // unless inside an <a> tag span.
-    if (!inLinkTag && (ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F' || ch === 'w' || ch === 'W' || ch === 'm' || ch === 'x')) {
+    if (!inLink && !inLinkTag && (ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F' || ch === 'w' || ch === 'W' || ch === 'm' || ch === 'x')) {
       const rest = src.slice(i);
       const mail = MAILTO_URL_RE.exec(rest);
       if (mail && (mail[0].startsWith('mailto:') || mail[0].startsWith('xmpp:'))) {
@@ -1190,20 +1276,33 @@ function renderInline(src, refs) {
       }
       const url = URL_HEAD_RE.exec(rest);
       if (url) {
-        const isWww = /^www\./i.test(url[0]);
+        const isWww = /^www\./.test(url[0]);
         const prev = i > 0 ? src[i - 1] : undefined;
         if (!isWww || prev === undefined || /[\s*_~(]/.test(prev)) {
           flushText();
           const text = backpedalUrl(url[0]);
           if (text.length > 0) {
-            nodes.push({ k: 'auto', s: text, href: isWww ? `http://${text}` : text });
+            if (stack.length > 0) {
+              // Inside brackets the match may not swallow the closing ']':
+              // the bracket gets its chance to form a link first. If it
+              // does not form, the ']' handling below gives the URL its
+              // full length back.
+              const rb = text.indexOf(']');
+              if (rb >= 0) {
+                const cut = text.slice(0, rb);
+                nodes.push({ k: 'auto', s: cut, href: isWww ? `http://${cut}` : cut, pos: i, trunc: i + rb });
+                i += rb;
+                continue;
+              }
+            }
+            nodes.push({ k: 'auto', s: text, href: isWww ? `http://${text}` : text, pos: i });
             i += text.length;
             continue;
           }
         }
       }
     }
-    if (!inLinkTag && /[A-Za-z0-9]/.test(ch)) {
+    if (!inLink && !inLinkTag && /[A-Za-z0-9]/.test(ch)) {
       const prev = i > 0 ? src[i - 1] : undefined;
       if (prev === undefined || !/[A-Za-z0-9._%+-]/.test(prev)) {
         const em = EMAIL_RE.exec(src.slice(i));
@@ -1220,7 +1319,12 @@ function renderInline(src, refs) {
     i++;
   }
   flushText();
+  return nodes;
+}
 
+/** Tokenise + process an inline fragment (see scanInline). */
+function renderInline(src, refs) {
+  const nodes = scanInline(src, refs, false);
   processInlineMarked(nodes, makeInlineCtx(src, refs));
   return renderNodes(nodes);
 }
@@ -1476,7 +1580,9 @@ function matchTable(lines, i) {
   });
   const rows = [];
   let j = i + 2;
-  while (j < lines.length && !isBlank(lines[j]) && !tableBodyInterrupt(lines[j])) {
+  // Row collection stops at a line of nothing but spaces (a tab-only line
+  // still counts as a row) or at a line starting another block.
+  while (j < lines.length && !/^ *$/.test(lines[j]) && !tableBodyInterrupt(lines[j])) {
     rows.push(splitRow(lines[j], header.length));
     j++;
   }
@@ -1487,7 +1593,8 @@ function tableBodyInterrupt(line) {
   if (isHR(line)) return true;
   if (/^ {0,3}#{1,6}(?:\s|$)/.test(line)) return true;
   if (/^ {0,3}>/.test(line)) return true;
-  if (isIndented(line)) return true;
+  const ind = /^(?: {4}| {0,3}\t)/.exec(line);
+  if (ind && line.length > ind[0].length) return true;
   if (matchFenceStart(line)) return true;
   if (/^ {0,3}(?:[*+-]|1[.)])[ \t]/.test(line)) return true;
   if (htmlBlockStart(line)) return true;
@@ -1528,6 +1635,24 @@ function interruptsParagraph(lines, j) {
   if (matchFenceStart(ln)) return true;
   if (/^ {0,3}(?:[*+-]|1[.)])[ \t]+[^ \t\n]/.test(ln)) return true;
   if (htmlBlockStart(ln)) return true;
+  if (tableAhead(lines, j)) return true;
+  return false;
+}
+
+/**
+ * Whether a line starts a new block token in list-item context, where the
+ * reference lexes text one line at a time: any list marker (any ordered
+ * start number, content optional), a complete HTML tag line, a table
+ * header, or any of the usual block starts.
+ */
+function interruptsTextRun(lines, j) {
+  const ln = lines[j];
+  if (isHR(ln)) return true;
+  if (/^ {0,3}#{1,6}(?:\s|$)/.test(ln)) return true;
+  if (QUOTE_RE.test(ln)) return true;
+  if (matchFenceStart(ln)) return true;
+  if (/^ {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/.test(ln)) return true;
+  if (htmlBlockStart(ln) || htmlType7(ln)) return true;
   if (tableAhead(lines, j)) return true;
   return false;
 }
@@ -1603,7 +1728,7 @@ function innerEndsWithParagraph(inner) {
       matchATX(ln) ||
       isHR(ln) ||
       QUOTE_RE.test(ln) ||
-      matchBullet(ln) ||
+      startsList(ln) ||
       htmlBlockStart(ln) ||
       isIndented(ln) ||
       tableAhead(lines, idx)
@@ -1684,13 +1809,16 @@ function beginsBlock(line, n, bulletAny) {
 }
 
 function htmlBeginAt(line, n) {
-  const sub = line.slice(Math.min(n, lead3(line)));
-  const rest = line.slice(lead3(line));
-  void sub;
+  // The tag must begin within the first n columns (spaces only; a leading
+  // tab puts the line beyond the clamp, as in the reference's tests).
+  let sp = 0;
+  while (line[sp] === ' ') sp++;
+  if (sp > n) return false;
+  const rest = line.slice(sp);
   if (rest[0] !== '<') return false;
-  if (HTML_TYPE1_RE.test(line)) return true;
+  if (HTML_TYPE1_RE.test(rest)) return true;
   if (rest.startsWith('<!--') || rest.startsWith('<?') || /^<![A-Za-z]/.test(rest) || rest.startsWith('<![CDATA[')) return true;
-  if (HTML_TYPE6_RE.test(line)) return true;
+  if (HTML_TYPE6_RE.test(rest)) return true;
   return false;
 }
 
@@ -1773,6 +1901,14 @@ function isLheadingPair(prevLine, underline) {
   return true;
 }
 
+/** Whether a line really starts a list item (marker followed by space, tab or end). */
+function startsList(line) {
+  const bm = matchBullet(line);
+  if (!bm) return false;
+  const after = line[bm.prefix.length];
+  return after === undefined || after === ' ' || after === '\t';
+}
+
 function collectList(lines, i, refs) {
   const first = matchBullet(lines[i]);
   if (!first) return null;
@@ -1800,9 +1936,11 @@ function collectList(lines, i, refs) {
     if (got.next <= startJ) break;
   }
   if (items.length === 0) return null;
-  const parsed = items.map((got) => {
-    const blocks = parseBlocks(got.text.split('\n'), refs, false);
-    return { text: got.text, blocks };
+  const parsed = items.map((got, idx) => {
+    // The reference trims the last item's text before lexing it.
+    const text = idx === items.length - 1 ? got.text.trimEnd() : got.text;
+    const blocks = parseBlocks(text.split('\n'), refs, false);
+    return { text, blocks };
   });
   for (let idx = 0; idx < parsed.length; idx++) {
     const item = parsed[idx];
@@ -1866,8 +2004,9 @@ function collectParagraph(lines, i, top, forced) {
     }
     if (isBlank(ln)) {
       // A spaces-only final line (nothing follows it, not even a newline) is
-      // paragraph content in the reference, not a blank separator.
-      if (j === lines.length - 1 && ln.length > 0) {
+      // paragraph content in the reference's top-level paragraph pattern,
+      // not a blank separator. In list-item context it is a space token.
+      if (top && j === lines.length - 1 && ln.length > 0) {
         collected.push(ln);
         j++;
       }
@@ -1886,7 +2025,7 @@ function collectParagraph(lines, i, top, forced) {
     // In list-item context an indented line starts a code chunk, which the block
     // loop may merge into this paragraph; it is not a plain continuation.
     if (!top && isIndented(ln)) break;
-    if (interruptsParagraph(lines, j)) break;
+    if (!top ? interruptsTextRun(lines, j) : interruptsParagraph(lines, j)) break;
     collected.push(ln);
     j++;
   }
