@@ -837,8 +837,13 @@ function tryEmStrong(nodes, i, ctx, param) {
     if (C.k !== 'delim' || C.ch !== r || C.n === 0) continue;
     const q = C.pos - ctx.base;
     if (q > bound) break;
-    if (skipPos >= q && skipPos < q + C.n) continue;
-    const b = C.n;
+    // Only runs visible in the masked string can close: a run the mask
+    // hid (inside a code span, a link, a tag) does not exist for the scan,
+    // and a partially hidden run counts with its visible length only.
+    if (masked[q] !== r) continue;
+    let b = 0;
+    while (masked[q + b] === r) b++;
+    if (skipPos >= q && skipPos < q + b) continue;
     const cls = classifyEm(r, classAt(masked, q - 1), classAt(masked, q + b));
     if (cls === null) continue;
     if (cls === 'pool') {
@@ -864,7 +869,7 @@ function tryEmStrong(nodes, i, ctx, param) {
     const kids = scanInline(contentStr, ctx.refs, ctx.inLink);
     processInlineMarked(kids, makeInlineCtx(contentStr, ctx.refs, ctx.inLink));
     const repl = [{ k: isEm ? 'em' : 'strong', kids }];
-    if (b > bUsed) repl.push({ k: 'delim', ch: r, n: b - bUsed, pos: C.pos + bUsed });
+    if (C.n > bUsed) repl.push({ k: 'delim', ch: r, n: C.n - bUsed, pos: C.pos + bUsed });
     nodes.splice(i, j - i + 1, ...repl);
     return true;
   }
@@ -893,8 +898,11 @@ function tryDel(nodes, i, ctx, param) {
     if (C.k !== 'delim' || C.ch !== '~' || C.n === 0) continue;
     const q = C.pos - ctx.base;
     if (q > bound) break;
-    if (C.n !== o) continue;
-    const cls = classifyDel(classAt(masked, q - 1), classAt(masked, q + C.n));
+    if (masked[q] !== '~') continue;
+    let visLen = 0;
+    while (masked[q + visLen] === '~') visLen++;
+    if (visLen !== o) continue;
+    const cls = classifyDel(classAt(masked, q - 1), classAt(masked, q + visLen));
     if (cls === null) continue;
     if (cls === 'pool') {
       p += o;
@@ -1664,19 +1672,36 @@ function tableAhead(lines, j) {
 
 const QUOTE_RE = /^ {0,3}>/;
 
-function stripQuoteLine(line) {
-  const m = QUOTE_RE.exec(line);
-  let rest = line.slice(m[0].length);
-  const ws = /^[ \t]+/.exec(rest);
-  if (ws) {
-    const expanded = expandTabs(ws[0], m[0].length);
-    rest = expanded + rest.slice(ws[0].length);
-    if (rest.startsWith(' ')) rest = rest.slice(1);
-  }
-  return rest;
+/** The content of a marked line after the ` {0,3}> ?` prefix. */
+function quoteContent(line) {
+  const m = /^ {0,3}> ?/.exec(line);
+  return line.slice(m[0].length);
 }
 
-/** Whether lines[j] would interrupt a paragraph (the reference's continuation lookaheads). */
+/**
+ * Whether a line interrupts the reference's blockquote continuation
+ * pattern (the block-text lookahead set: blank, thematic break, heading,
+ * quote marker, fence, list marker, HTML start).
+ */
+function keInterrupts(line) {
+  if (isBlank(line)) return true;
+  if (isHR(line)) return true;
+  if (/^ {0,3}#{1,6}(?:[ \t]|$)/.test(line)) return true;
+  if (QUOTE_RE.test(line)) return true;
+  if (matchFenceStart(line)) return true;
+  if (/^ {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/.test(line)) return true;
+  if (htmlBeginAt(line, 3)) return true;
+  return false;
+}
+
+/** Strip one segment's quote markers the way the reference does. */
+function stripQuoteSegment(h) {
+  let s = h.replace(/^( {0,3}>)([ \t]+)/gm, (g, b, m) => b + expandTabs(m, b.length));
+  s = s.replace(/\n {0,3}((?:=+|-+)[ \t]*)(?=\n|$)/g, '\n    $1');
+  s = s.replace(/^ {0,3}>[ \t]?/gm, '');
+  return s;
+}
+
 function interruptsParagraph(lines, j) {
   const ln = lines[j];
   if (isHR(ln)) return true;
@@ -1689,12 +1714,6 @@ function interruptsParagraph(lines, j) {
   return false;
 }
 
-/**
- * Whether a line starts a new block token in list-item context, where the
- * reference lexes text one line at a time: any list marker (any ordered
- * start number, content optional), a complete HTML tag line, a table
- * header, or any of the usual block starts.
- */
 function interruptsTextRun(lines, j) {
   const ln = lines[j];
   if (isHR(ln)) return true;
@@ -1707,146 +1726,127 @@ function interruptsTextRun(lines, j) {
   return false;
 }
 
-/** Whether an unmarked line may lazily continue a blockquote's open paragraph. */
-function lazyInterrupt(lines, j) {
-  const ln = lines[j];
-  if (isHR(ln)) return true;
-  if (/^ {0,3}#{1,6}(?:\s|$)/.test(ln)) return true;
-  if (QUOTE_RE.test(ln)) return true;
-  if (matchFenceStart(ln)) return true;
-  if (/^ {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/.test(ln)) return true;
-  if (htmlBlockStart(ln)) return true;
-  return false;
-}
-
-/** A line with every leading blockquote marker stripped (for classification only). */
-function effLine(line) {
-  let s = line;
-  for (;;) {
-    if (QUOTE_RE.test(s)) {
-      s = stripQuoteLine(s);
-      continue;
-    }
-    // A list marker's content is what decides the innermost open construct.
-    const bm = matchBullet(s);
-    if (bm) {
-      const rest = s.slice(bm.prefix.length);
-      if (rest === '' || rest[0] === ' ' || rest[0] === '\t') {
-        s = rest.replace(/^[ \t]+/, '');
-        continue;
-      }
-    }
-    return s;
-  }
-}
-
-/** Whether the inner lines collected so far end inside an open paragraph. */
-function innerEndsWithParagraph(inner) {
-  const lines = inner.map(effLine);
-  let start = lines.length - 1;
-  while (start > 0 && !isBlank(lines[start - 1])) start--;
-  let para = false;
-  let inFence = false;
-  let fenceCh = '';
-  let fenceLen = 0;
-  for (let idx = start; idx < lines.length; idx++) {
-    const ln = lines[idx];
-    if (inFence) {
-      if (isFenceClose(ln, fenceCh, fenceLen)) inFence = false;
-      para = false;
-      continue;
-    }
-    if (para) {
-      if (setextDepth(ln)) {
-        para = false;
-        continue;
-      }
-      if (interruptsParagraph(lines, idx)) {
-        para = false;
-        // fall through: ln starts a new block
-      } else {
-        continue;
-      }
-    }
-    const f = matchFenceStart(ln);
-    if (f) {
-      inFence = true;
-      fenceCh = f.ch;
-      fenceLen = f.len;
-      para = false;
-    } else if (
-      matchATX(ln) ||
-      isHR(ln) ||
-      QUOTE_RE.test(ln) ||
-      startsList(ln) ||
-      htmlBlockStart(ln) ||
-      isIndented(ln) ||
-      tableAhead(lines, idx)
-    ) {
-      para = false;
-    } else {
-      para = true;
-    }
-  }
-  if (!para || inFence) return false;
-  // A fence opened in an earlier blank-separated segment still swallows
-  // the tail of the inner text: veto laziness while it is unclosed.
-  let open = false;
-  let oCh = '';
-  let oLen = 0;
-  for (const ln of lines) {
-    if (open) {
-      if (isFenceClose(ln, oCh, oLen)) open = false;
-    } else {
-      const f = matchFenceStart(ln);
-      if (f) {
-        open = true;
-        oCh = f.ch;
-        oLen = f.len;
-      }
-    }
-  }
-  return !open;
-}
-
+/**
+ * Collect a blockquote starting at lines[i], following the reference's
+ * algorithm: a chunk of marked lines (each extended through following
+ * unmarked lines that do not interrupt its continuation pattern) is
+ * processed in segments of leading unmarked lines plus marked lines.
+ * Each segment is stripped and lexed separately into one shared block
+ * list; a segment ending in a code/heading/hr/html/table block ends the
+ * quote, and a trailing nested quote or list is re-lexed together with
+ * the remaining chunk lines so it can absorb them.
+ */
 function collectQuote(lines, i, refs) {
-  const inner = [];
-  const forced = new Set();
+  const chunk = [];
   let j = i;
-  let prevBlank = true;
-  let prevLazy = false;
-  while (j < lines.length) {
-    const ln = lines[j];
-    if (QUOTE_RE.test(ln)) {
-      const stripped = stripQuoteLine(ln);
-      inner.push(stripped);
-      prevBlank = isBlank(stripped);
-      prevLazy = false;
-      j++;
-      continue;
-    }
-    if (isBlank(ln)) break;
-    if (!prevBlank && innerEndsWithParagraph(inner) && !lazyInterrupt(lines, j)) {
-      // A lazy setext underline that does not start a segment is rewritten by the
-      // reference with a four-space indent, which keeps it as paragraph text.
-      if (prevLazy && /^ {0,3}(?:=+|-+)[ \t]*$/.test(ln)) {
-        inner.push(`    ${ln.slice(lead3(ln))}`);
-      } else if (isIndented(ln)) {
-        // A lazy indented line joins the paragraph as merged code text: its indent
-        // is removed and it may not start a block of its own.
-        inner.push(stripCodeIndent(ln));
-        forced.add(inner.length - 1);
-      } else {
-        inner.push(ln);
+  while (j < lines.length && QUOTE_RE.test(lines[j])) {
+    chunk.push(lines[j]);
+    const content = quoteContent(lines[j]);
+    j++;
+    if (!/^[ \t]*$/.test(content)) {
+      while (j < lines.length && !keInterrupts(lines[j])) {
+        chunk.push(lines[j]);
+        j++;
       }
-      prevBlank = false;
-      prevLazy = true;
-      j++;
+    }
+  }
+  const blocks = [];
+  let pos = 0;
+  let endPos = 0;
+  while (pos < chunk.length) {
+    const seg = [];
+    let seenMarked = false;
+    while (pos < chunk.length) {
+      if (QUOTE_RE.test(chunk[pos])) {
+        seg.push(chunk[pos]);
+        seenMarked = true;
+        pos++;
+      } else if (!seenMarked) {
+        seg.push(chunk[pos]);
+        pos++;
+      } else break;
+    }
+    const u = stripQuoteSegment(seg.join('\n'));
+    let uLines = u === '' ? [] : u.split('\n');
+    // Cross-segment merges into a trailing paragraph: leading blank lines
+    // (at most one) are transparent; a leading definition or indented
+    // chunk folds into the paragraph as literal text instead of forming
+    // its own token, and the segment's first paragraph merges too.
+    let leadBlanks = 0;
+    while (leadBlanks < uLines.length && isBlank(uLines[leadBlanks])) leadBlanks++;
+    const lastBlock = () => blocks[blocks.length - 1];
+    if (lastBlock() && lastBlock().t === 'para' && leadBlanks <= 1) {
+      let rest = uLines.slice(leadBlanks);
+      let merged = true;
+      while (merged && rest.length > 0) {
+        merged = false;
+        const probe = consumeDef(rest, 0, new Map());
+        if (probe !== null) {
+          lastBlock().text += `\n${rest.slice(0, probe).join('\n')}`;
+          rest = rest.slice(probe);
+          merged = true;
+          continue;
+        }
+        if (isIndented(rest[0])) {
+          let k = 0;
+          while (k < rest.length && (isCodeLine(rest[k]) || isBlank(rest[k]))) k++;
+          const raw = trimRawBlankLines(rawFor(rest, 0, k - 1));
+          const text = raw.split('\n').map(stripCodeIndent).join('\n');
+          lastBlock().text += `\n${text.replace(/\n$/, '')}`;
+          rest = rest.slice(k);
+          merged = true;
+        }
+      }
+      uLines = rest;
+    }
+    const segBlocks = parseBlocks(uLines, refs, true);
+    if (
+      segBlocks.length > 0 &&
+      segBlocks[0].t === 'para' &&
+      lastBlock() &&
+      lastBlock().t === 'para' &&
+      leadBlanks <= 1
+    ) {
+      lastBlock().text += `\n${segBlocks[0].text}`;
+      segBlocks.shift();
+    }
+    blocks.push(...segBlocks);
+    endPos = pos;
+    if (pos >= chunk.length) break;
+    const last = lastBlock();
+    if (!last) continue;
+    if (last.t === 'code' || last.t === 'heading' || last.t === 'hr' || last.t === 'html' || last.t === 'table') break;
+    if (last.t === 'quote') {
+      const remaining = chunk.slice(pos);
+      const mLines = (last.rawLines || []).concat(
+        remaining.map((l) => l.replace(/^ {0,3}>[ \t]?/, '')),
+      );
+      const f = collectQuote(mLines, 0, refs);
+      const leftover = mLines.length - f.next;
+      const absorbed = Math.max(0, remaining.length - leftover);
+      blocks[blocks.length - 1] = f.node;
+      pos += absorbed;
+      endPos = pos;
+      if (pos < chunk.length && QUOTE_RE.test(chunk[pos])) continue;
+      break;
+    }
+    if (last.t === 'list') {
+      const remaining = chunk.slice(pos);
+      const bLines = (last.rawLines || []).concat(remaining);
+      const m2 = collectList(bLines, 0, refs);
+      if (m2) {
+        const extra = Math.max(0, m2.next - (m2.trailingGap || 0) - (last.rawLines || []).length);
+        if (extra > 0) {
+          blocks[blocks.length - 1] = m2.node;
+          pos += extra;
+          endPos = pos;
+        }
+      }
       continue;
     }
-    break;
   }
-  return { node: { t: 'quote', kids: parseBlocks(inner, refs, true, forced) }, next: j };
+  const node = { t: 'quote', kids: blocks, rawLines: chunk.slice(0, endPos) };
+  return { node, next: i + endPos };
 }
 
 // --- Lists ---------------------------------------------------------------------
@@ -2041,7 +2041,14 @@ function collectList(lines, i, refs) {
     }
   }
   return {
-    node: { t: 'list', ordered: first.ordered, start: first.start, loose, items: parsed },
+    node: {
+      t: 'list',
+      ordered: first.ordered,
+      start: first.start,
+      loose,
+      items: parsed,
+      rawLines: lines.slice(i, j - trailingGap),
+    },
     next: j,
     trailingGap,
   };
