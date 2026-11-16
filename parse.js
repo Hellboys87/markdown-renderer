@@ -112,7 +112,7 @@ function expandTabs(s, startCol) {
 // Inline parsing
 // ---------------------------------------------------------------------------
 
-// Node kinds: text {s}, html {s}, code {s}, br {}, delim {ch, n, open, close},
+// Node kinds: text {s}, html {s}, code {s}, br {}, delim {ch, n, pos},
 // open {img, start, end} (bracket opener; start/end index the label in the source),
 // link {href, title, img, kids}, auto {href, s}.
 
@@ -460,9 +460,21 @@ function tryFormLink(src, closeIdx, opener, nodes, refs, inLink, state) {
     }
   };
   convertAutos(kids);
-  const labelCtx = makeInlineCtx(labelRaw, refs, true, state);
-  labelCtx.base = opener.start;
-  processInlineMarked(kids, labelCtx);
+  const counts = { '*': 0, '_': 0, '~': 0 };
+  const lastDelimPos = { '*': -1, '_': -1, '~': -1 };
+  for (let x = 0; x < kids.length; x++) {
+    const kd = kids[x];
+    if (kd.k === 'delim' && kd.n > 0 && !kd.inert) {
+      counts[kd.ch]++;
+      if (kd.pos > lastDelimPos[kd.ch]) lastDelimPos[kd.ch] = kd.pos;
+    }
+  }
+  if (counts['*'] >= 2 || counts['_'] >= 2 || counts['~'] >= 2) {
+    const labelCtx = makeInlineCtx(labelRaw, refs, true, state);
+    labelCtx.base = opener.start;
+    labelCtx.lastDelimPos = lastDelimPos;
+    processInlineMarked(kids, labelCtx);
+  }
   return { end, node: { k: 'link', href, title, img: opener.img, kids } };
 }
 
@@ -485,8 +497,8 @@ function tryFormLink(src, closeIdx, opener, nodes, refs, inLink, state) {
 const J_CLASS_RE = /[\s\p{P}\p{S}]/u;
 const PUNCT_TEST_RE = /^(?![*_])[\s\p{P}\p{S}]/u;
 const ALNUM_RE = /[\p{L}\p{N}]/u;
-const ALT0_AST = /^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)/;
-const ALT0_UND = /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)/;
+const ALT0_AST = /[^_*]*?__[^_*]*?\*[^_*]*?(?=__)/y;
+const ALT0_UND = /[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)/y;
 
 /** Class of a single code point for delimiter-run classification. */
 function charClass(c) {
@@ -609,24 +621,45 @@ function matchParenIn(s, from) {
  * "++", and the label part of a resolved reference link is blanked the
  * same way. Lengths are preserved, so positions line up with the source.
  */
-function maskInlineString(s, refs) {
+/**
+ * The emphasis mask of a fragment (constructions the pairing scan must
+ * not see into are bracketed off, escapes become '+') together with the
+ * last-possible-closer table computed over it.
+ */
+function computeMask(s, refs) {
+  const last = { '*': -1, '_': -1, '~': -1 };
+  // Scan a plain (unhidden) stretch of the source, recording closer runs.
+  const scanPlain = (from, to, outLen, prevOut) => {
+    let x = from;
+    while (x < to) {
+      const c = s[x];
+      if (c === '*' || c === '_' || c === '~') {
+        let e = x + 1;
+        while (e < to && s[e] === c) e++;
+        const prev = x === from ? prevOut : s[x - 1];
+        if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
+          last[c] = outLen + (x - from);
+        }
+        x = e;
+      } else x++;
+    }
+  };
   // The mask only ever rewrites escapes, code spans, tags and bracketed
   // constructs; with none of those characters present it is the identity.
-  if (!/[`[<\\]/.test(s)) return s;
-  const a = s.split('');
+  if (!/[`[<\\]/.test(s)) {
+    scanPlain(0, s.length, 0, '\n');
+    return { masked: s, last };
+  }
+  const spans = [];
   const hide = (from, to) => {
-    if (to - from < 2) return;
-    a[from] = '[';
-    for (let x = from + 1; x < to - 1; x++) a[x] = 'a';
-    a[to - 1] = ']';
+    if (to - from >= 2) spans.push([from, to, 0]);
   };
   const n = s.length;
   let i = 0;
   while (i < n) {
     const c = s[i];
     if (c === '\\' && i + 1 < n && isPunctChar(s[i + 1])) {
-      a[i] = '+';
-      a[i + 1] = '+';
+      spans.push([i, i + 2, 1]);
       i += 2;
       continue;
     }
@@ -701,7 +734,75 @@ function maskInlineString(s, refs) {
     }
     i++;
   }
-  return a.join('');
+  if (spans.length === 0) {
+    scanPlain(0, s.length, 0, '\n');
+    return { masked: s, last };
+  }
+  // Spans are normally recorded in order; a hidden reference label is the
+  // one exception (scanning resumes inside its text), so fall back to
+  // positional writes when they are not.
+  let ordered = true;
+  for (let x = 1; x < spans.length; x++) {
+    if (spans[x][0] < spans[x - 1][1]) {
+      ordered = false;
+      break;
+    }
+  }
+  if (!ordered) {
+    const a = s.split('');
+    for (const [from, to, kind] of spans) {
+      if (kind === 1) {
+        a[from] = '+';
+        a[from + 1] = '+';
+      } else {
+        a[from] = '[';
+        for (let x = from + 1; x < to - 1; x++) a[x] = 'a';
+        a[to - 1] = ']';
+      }
+    }
+    const masked = a.join('');
+    scanPlain(0, s.length, 0, '\n');
+    // Recompute the closer table over the built mask (positions may have
+    // shifted in character, never in length).
+    last['*'] = -1;
+    last['_'] = -1;
+    last['~'] = -1;
+    let x = 0;
+    while (x < masked.length) {
+      const c = masked[x];
+      if (c === '*' || c === '_' || c === '~') {
+        let e = x + 1;
+        while (e < masked.length && masked[e] === c) e++;
+        const prev = x === 0 ? '\n' : masked[x - 1];
+        if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') last[c] = x;
+        x = e;
+      } else x++;
+    }
+    return { masked, last };
+  }
+  let masked = '';
+  let pos = 0;
+  let prevOut = '\n';
+  for (const [from, to, kind] of spans) {
+    if (from > pos) {
+      scanPlain(pos, from, masked.length, prevOut);
+      masked += s.slice(pos, from);
+      prevOut = s[from - 1];
+    }
+    if (kind === 1) {
+      masked += '++';
+      prevOut = '+';
+    } else {
+      masked += `[${'a'.repeat(to - from - 2)}]`;
+      prevOut = ']';
+    }
+    pos = to;
+  }
+  if (pos < s.length) {
+    scanPlain(pos, s.length, masked.length, prevOut);
+    masked += s.slice(pos);
+  }
+  return { masked, last };
 }
 
 /**
@@ -709,22 +810,6 @@ function maskInlineString(s, refs) {
  * masked source whose preceding character is not whitespace — no closer
  * can begin after it.
  */
-function lastCloserIndices(masked) {
-  const out = { '*': -1, '_': -1, '~': -1 };
-  const n = masked.length;
-  for (let s = 0; s < n; s++) {
-    const c = masked[s];
-    if (c !== '*' && c !== '_' && c !== '~') continue;
-    let e = s + 1;
-    while (e < n && masked[e] === c) e++;
-    const prev = s === 0 ? '\n' : masked[s - 1];
-    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
-      out[c] = s;
-    }
-    s = e - 1;
-  }
-  return out;
-}
 
 /**
  * Classify a candidate closer run for an emphasis opener of character `r`
@@ -775,11 +860,11 @@ function makeInlineCtx(s, refs, inLink = false, state = null) {
       state: state || { inLink: false, inRawBlock: false },
     };
   }
-  const masked = maskInlineString(s, refs);
+  const { masked, last } = computeMask(s, refs);
   return {
     s,
     masked,
-    last: lastCloserIndices(masked),
+    last,
     base: 0,
     refs,
     inLink,
@@ -834,7 +919,9 @@ function tryEmStrong(nodes, i, ctx, param) {
   const oBreak = param === r;
   // A run of this character sitting inside the first opposite pair is skipped.
   let skipPos = -1;
-  const m0 = (r === '*' ? ALT0_AST : ALT0_UND).exec(masked.slice(pos + k));
+  const alt0 = r === '*' ? ALT0_AST : ALT0_UND;
+  alt0.lastIndex = pos + k;
+  const m0 = alt0.exec(masked);
   if (m0) {
     const dbl = r === '*' ? '__' : '**';
     const di = m0[0].indexOf(dbl);
@@ -879,7 +966,7 @@ function tryEmStrong(nodes, i, ctx, param) {
     // resolve against the content's end, not the outer text.
     const contentStr = s.slice(pos + uo, q + bUsed - uo);
     const kids = scanInline(contentStr, ctx.refs, ctx.inLink, ctx.state);
-    processInlineMarked(kids, makeInlineCtx(contentStr, ctx.refs, ctx.inLink, ctx.state));
+    finishInline(kids, contentStr, ctx.refs, ctx.inLink, ctx.state);
     const repl = [{ k: isEm ? 'em' : 'strong', kids }];
     if (C.n > bUsed) repl.push({ k: 'delim', ch: r, n: C.n - bUsed, pos: C.pos + bUsed });
     nodes.splice(i, j - i + 1, ...repl);
@@ -924,7 +1011,7 @@ function tryDel(nodes, i, ctx, param) {
     if (p > 0) continue;
     const contentStr = s.slice(pos + o, q);
     const kids = scanInline(contentStr, ctx.refs, ctx.inLink, ctx.state);
-    processInlineMarked(kids, makeInlineCtx(contentStr, ctx.refs, ctx.inLink, ctx.state));
+    finishInline(kids, contentStr, ctx.refs, ctx.inLink, ctx.state);
     nodes.splice(i, j - i + 1, { k: 'del', kids });
     return true;
   }
@@ -945,6 +1032,14 @@ function processInlineMarked(nodes, ctx) {
   while (i < nodes.length) {
     const nd = nodes[i];
     if (nd.k === 'delim' && nd.n > 0 && !nd.inert && (nd.ch === '*' || nd.ch === '_')) {
+      if (ctx.lastDelimPos && ctx.lastDelimPos[nd.ch] <= nd.pos) {
+        // No later candidate exists: the attempt is bound to fail, which
+        // leaves the run as text and threads the previous character.
+        prevText = true;
+        if (nd.ch !== '_') prevChar = nd.ch;
+        i++;
+        continue;
+      }
       if (tryEmStrong(nodes, i, ctx, prevText ? prevChar : '')) {
         prevText = false;
         i++;
@@ -973,6 +1068,12 @@ function processInlineMarked(nodes, ctx) {
       continue;
     }
     if (nd.k === 'delim' && nd.n > 0 && nd.ch === '~') {
+      if (ctx.lastDelimPos && ctx.lastDelimPos['~'] <= nd.pos) {
+        prevText = true;
+        prevChar = '~';
+        i++;
+        continue;
+      }
       if (tryDel(nodes, i, ctx, prevText ? prevChar : '')) {
         prevText = false;
         i++;
@@ -1290,30 +1391,8 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
     if (ch === '*' || ch === '_' || ch === '~') {
       let run = 1;
       while (src[i + run] === ch) run++;
-      const prev = i > 0 ? src[i - 1] : undefined;
-      const next = src[i + run];
-      const prevIsSpace = isSpaceChar(prev);
-      const prevIsPunct = isPunctChar(prev);
-      const nextIsSpace = isSpaceChar(next);
-      const nextIsPunct = isPunctChar(next);
-      const leftFlank = !nextIsSpace && (!nextIsPunct || prevIsSpace || prevIsPunct);
-      const rightFlank = !prevIsSpace && (!prevIsPunct || nextIsSpace || nextIsPunct);
-      let open;
-      let close;
-      if (ch === '*') {
-        open = leftFlank;
-        close = rightFlank;
-      } else if (ch === '_') {
-        open = leftFlank && (!rightFlank || prevIsPunct);
-        close = rightFlank && (!leftFlank || nextIsPunct);
-      } else {
-        // '~': the reference pairs single or double runs; a run opens when followed by a
-        // non-space, non-'~' character or punctuation, closes when preceded likewise.
-        open = !nextIsSpace && next !== '~';
-        close = !prevIsSpace && prev !== '~';
-      }
       flushText();
-      nodes.push({ k: 'delim', ch, n: run, open, close, pos: i });
+      nodes.push({ k: 'delim', ch, n: run, pos: i });
       i += run;
       continue;
     }
@@ -1394,8 +1473,20 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
     if (!inLink && !inLinkTag && /[A-Za-z0-9]/.test(ch)) {
       const prev = i > 0 ? src[i - 1] : undefined;
       if (prev === undefined || !/[A-Za-z0-9._%+-]/.test(prev)) {
+        // The address needs an '@' right after its local-part characters;
+        // most word starts do not have one, so skip the regex for them.
+        let eEnd = i + 1;
+        while (eEnd < n) {
+          const cc = src.charCodeAt(eEnd);
+          if (
+            (cc >= 48 && cc <= 57) || (cc >= 65 && cc <= 90) || (cc >= 97 && cc <= 122) ||
+            cc === 46 || cc === 95 || cc === 37 || cc === 43 || cc === 45
+          ) {
+            eEnd++;
+          } else break;
+        }
         EMAIL_RE_Y.lastIndex = i;
-        const em = EMAIL_RE_Y.exec(src);
+        const em = src[eEnd] === '@' ? EMAIL_RE_Y.exec(src) : null;
         if (em) {
           flushText();
           nodes.push({ k: 'auto', s: em[0], href: `mailto:${em[0]}` });
@@ -1468,10 +1559,33 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
   return nodes;
 }
 
+/**
+ * Pair emphasis/strikethrough in a freshly scanned node list. When no
+ * delimiter character occurs more than once, no attempt can succeed (a
+ * pairing needs a later candidate run), so the mask and the pairing pass
+ * are skipped altogether; otherwise the context records each character's
+ * last candidate index so hopeless attempts can shortcut.
+ */
+function finishInline(nodes, s, refs, inLink, state) {
+  const counts = { '*': 0, '_': 0, '~': 0 };
+  const lastDelimPos = { '*': -1, '_': -1, '~': -1 };
+  for (let x = 0; x < nodes.length; x++) {
+    const nd = nodes[x];
+    if (nd.k === 'delim' && nd.n > 0 && !nd.inert) {
+      counts[nd.ch]++;
+      if (nd.pos > lastDelimPos[nd.ch]) lastDelimPos[nd.ch] = nd.pos;
+    }
+  }
+  if (counts['*'] < 2 && counts['_'] < 2 && counts['~'] < 2) return;
+  const ctx = makeInlineCtx(s, refs, inLink, state);
+  ctx.lastDelimPos = lastDelimPos;
+  processInlineMarked(nodes, ctx);
+}
+
 /** Tokenise + process an inline fragment (see scanInline). */
 function renderInline(src, refs, state = { inLink: false, inRawBlock: false }) {
   const nodes = scanInline(src, refs, false, state);
-  processInlineMarked(nodes, makeInlineCtx(src, refs, false, state));
+  finishInline(nodes, src, refs, false, state);
   return renderNodes(nodes);
 }
 
