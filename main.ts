@@ -1,8 +1,11 @@
 // Driver for the markdown-render-speed-02 harness: read every case from
-// /input/cases.json, render each one with parse.js, and write the HTML strings,
-// in case order, to /output/html.json.
+// cases.json in the input directory, render each one with parse.js, and
+// write the HTML strings, in case order, as html.json in the output
+// directory. The harness mounts the directories at /input and /output in
+// its container; outside a container the MAKEFUN_INPUT_DIR and
+// MAKEFUN_OUTPUT_DIR environment variables stand in for them.
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { join } from 'node:path';
 import { parse } from './parse.js';
 
 interface Case {
@@ -10,11 +13,11 @@ interface Case {
   markdown: string;
 }
 
-const inputPath = '/input/cases.json';
-const outputPath = '/output/html.json';
+const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const cases = JSON.parse(readFileSync(inputPath, 'utf8')) as Case[];
+const cases = JSON.parse(readFileSync(join(inputDir, 'cases.json'), 'utf8')) as Case[];
 const rendered = cases.map((entry) => parse(entry.markdown));
 
-mkdirSync(dirname(outputPath), { recursive: true });
-writeFileSync(outputPath, JSON.stringify(rendered));
+mkdirSync(outputDir, { recursive: true });
+writeFileSync(join(outputDir, 'html.json'), JSON.stringify(rendered));
