@@ -334,6 +334,46 @@ function matchNestedLabel(s, start) {
 }
 
 /**
+ * The index of the ']' that ends a label starting at `start` (the index
+ * just after the opening bracket), following the reference's label
+ * pattern: escapes and nested bracket groups are skipped, and a backtick
+ * run consumes everything up to the next backtick run (the content may
+ * contain ']'). Returns -1 when the pattern cannot match.
+ */
+function labelScanEnd(s, start) {
+  const n = s.length;
+  let i = start;
+  while (i < n) {
+    const c = s[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '`') {
+      let run = 1;
+      while (s[i + run] === '`') run++;
+      let j = i + run;
+      while (j < n && s[j] !== '`') j++;
+      if (j < n) {
+        let r2 = 1;
+        while (s[j + r2] === '`') r2++;
+        i = j + r2;
+        continue;
+      }
+      // No closing run: only a run of 2+ backticks right before ']' works.
+      if (run >= 2 && s[i + run] === ']') return i + run;
+      return -1;
+    }
+    if (c === '[') {
+      const end = matchNestedLabel(s, i);
+      if (end < 0) return -1;
+      i = end;
+      continue;
+    }
+    if (c === ']') return i;
+    i++;
+  }
+  return -1;
+}
+
+/**
  * Whether a link label can match the reference's label pattern at all:
  * plain characters, escapes and nested bracket groups are fine; a backtick
  * must open a run whose content holds no backticks and which is closed by
@@ -1068,10 +1108,17 @@ function scanInline(src, refs, inLink) {
     if (ch === '`') {
       let run = 1;
       while (src[i + run] === '`') run++;
-      // Find a closing run of exactly the same length.
+      // Find a closing run of exactly the same length. Inside brackets the
+      // search may not cross the ']' that ends the innermost label (the
+      // reference matches the label before it ever looks for code spans).
+      let limit = n;
+      if (stack.length > 0) {
+        const topOpener = stack[stack.length - 1];
+        if (topOpener.labelEnd !== undefined && topOpener.labelEnd >= 0) limit = topOpener.labelEnd;
+      }
       let j = i + run;
       let closeStart = -1;
-      while (j < n) {
+      while (j < limit) {
         if (src[j] === '`') {
           let r2 = 1;
           while (src[j + r2] === '`') r2++;
@@ -1130,7 +1177,7 @@ function scanInline(src, refs, inLink) {
 
     if (ch === '!' && src[i + 1] === '[') {
       flushText();
-      const opener = { k: 'open', img: true, start: i + 2, nodeIndex: nodes.length };
+      const opener = { k: 'open', img: true, start: i + 2, nodeIndex: nodes.length, labelEnd: labelScanEnd(src, i + 2) };
       nodes.push(opener);
       stack.push(opener);
       i += 2;
@@ -1139,7 +1186,7 @@ function scanInline(src, refs, inLink) {
 
     if (ch === '[') {
       flushText();
-      const opener = { k: 'open', img: false, start: i + 1, nodeIndex: nodes.length };
+      const opener = { k: 'open', img: false, start: i + 1, nodeIndex: nodes.length, labelEnd: labelScanEnd(src, i + 1) };
       nodes.push(opener);
       stack.push(opener);
       i++;
@@ -1280,21 +1327,24 @@ function scanInline(src, refs, inLink) {
         const prev = i > 0 ? src[i - 1] : undefined;
         if (!isWww || prev === undefined || /[\s*_~(]/.test(prev)) {
           flushText();
-          const text = backpedalUrl(url[0]);
-          if (text.length > 0) {
-            if (stack.length > 0) {
-              // Inside brackets the match may not swallow the closing ']':
-              // the bracket gets its chance to form a link first. If it
-              // does not form, the ']' handling below gives the URL its
-              // full length back.
-              const rb = text.indexOf(']');
-              if (rb >= 0) {
-                const cut = text.slice(0, rb);
+          if (stack.length > 0) {
+            // Inside brackets the match may not swallow the closing ']':
+            // cap at the bracket first, then trim the capped text, so
+            // trailing delimiters stay in the stream as delimiter runs.
+            // If the bracket does not form a link, the ']' handling gives
+            // the URL its full length back.
+            const rb = url[0].indexOf(']');
+            if (rb >= 0) {
+              const cut = backpedalUrl(url[0].slice(0, rb));
+              if (cut.length > 0) {
                 nodes.push({ k: 'auto', s: cut, href: isWww ? `http://${cut}` : cut, pos: i, trunc: i + rb });
-                i += rb;
+                i += cut.length;
                 continue;
               }
             }
+          }
+          const text = backpedalUrl(url[0]);
+          if (text.length > 0) {
             nodes.push({ k: 'auto', s: text, href: isWww ? `http://${text}` : text, pos: i });
             i += text.length;
             continue;
