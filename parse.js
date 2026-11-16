@@ -139,40 +139,23 @@ const URL_HEAD_RE = /^(?:(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.)(?:[A
 const EMAIL_RE = /^[A-Za-z0-9._+-]+@[A-Za-z0-9-_]+(?:\.[A-Za-z0-9-_]*[A-Za-z0-9])+(?![\w-])/;
 const MAILTO_URL_RE = /^(?:mailto:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])|xmpp:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?)/;
 
-/** GFM trailing-punctuation / unbalanced-paren / trailing-entity trimming for bare URLs. */
+/**
+ * GFM trimming for bare URLs: the kept text is the longest prefix that
+ * splits into chunks of plain characters (no URI punctuation), balanced
+ * parenthesis groups, ampersands that do not start an entity running to
+ * the end, and punctuation runs that are not at the very end. Whatever
+ * suffix cannot be chunked is dropped, and the process repeats until the
+ * text is stable.
+ */
+const URL_CHUNK_RE = /^(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
 function backpedalUrl(s) {
-  // The reference trims an autolink's tail: trailing punctuation is dropped one
-  // character at a time, an unbalanced ')' is dropped, and a ';' that ends a named
-  // entity reference is kept. Repeat until the tail is stable.
-  for (;;) {
-    if (s.length === 0) return s;
-    const last = s[s.length - 1];
-    if (last === ';') {
-      // A trailing entity-shaped run is not part of the link at all.
-      const ent = /&[A-Za-z0-9]+;$/.exec(s);
-      if (ent) {
-        s = s.slice(0, s.length - ent[0].length);
-        continue;
-      }
-    }
-    if ('?!.,:;*_\'"~'.includes(last)) {
-      s = s.slice(0, -1);
-      continue;
-    }
-    if (last === ')') {
-      let opens = 0;
-      let closes = 0;
-      for (const c of s) {
-        if (c === '(') opens++;
-        else if (c === ')') closes++;
-      }
-      if (closes > opens) {
-        s = s.slice(0, -1);
-        continue;
-      }
-    }
-    return s;
-  }
+  let prev;
+  do {
+    prev = s;
+    const m = URL_CHUNK_RE.exec(s);
+    s = m ? m[0] : '';
+  } while (s !== prev && s.length > 0);
+  return s;
 }
 
 /**
@@ -1257,7 +1240,8 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
       // its full length back, swallowing the ']' as the reference's URL
       // tokeniser would.
       const lastNode = nodes[nodes.length - 1];
-      if (lastNode && lastNode.k === 'auto' && lastNode.trunc === i && textBuf === '') {
+      if (lastNode && lastNode.k === 'auto' && lastNode.trunc === i && textBuf === (lastNode.tail || '')) {
+        textBuf = '';
         const m2 = URL_HEAD_RE.exec(src.slice(lastNode.pos));
         const full = backpedalUrl(m2[0]);
         lastNode.s = full;
@@ -1361,7 +1345,14 @@ function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: fals
             if (rb >= 0) {
               const cut = backpedalUrl(url[0].slice(0, rb));
               if (cut.length > 0) {
-                nodes.push({ k: 'auto', s: cut, href: isWww ? `http://${cut}` : cut, pos: i, trunc: i + rb });
+                nodes.push({
+                  k: 'auto',
+                  s: cut,
+                  href: isWww ? `http://${cut}` : cut,
+                  pos: i,
+                  trunc: i + rb,
+                  tail: url[0].slice(cut.length, rb),
+                });
                 i += cut.length;
                 continue;
               }
