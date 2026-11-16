@@ -416,7 +416,7 @@ function labelPatternOk(label) {
  * bracket node on top of the stack and `nodes` is the node list built so far (the opener is the
  * last "open" node in it). Returns { end, node } on success, null on failure.
  */
-function tryFormLink(src, closeIdx, opener, nodes, refs, inLink) {
+function tryFormLink(src, closeIdx, opener, nodes, refs, inLink, state) {
   const labelRaw = src.slice(opener.start, closeIdx);
   // Inside link text, links do not form (images still do), and a label that
   // the reference's label pattern cannot match forms nothing at all.
@@ -472,7 +472,7 @@ function tryFormLink(src, closeIdx, opener, nodes, refs, inLink) {
     }
   };
   convertAutos(kids);
-  const labelCtx = makeInlineCtx(labelRaw, refs, true);
+  const labelCtx = makeInlineCtx(labelRaw, refs, true, state);
   labelCtx.base = opener.start;
   processInlineMarked(kids, labelCtx);
   return { end, node: { k: 'link', href, title, img: opener.img, kids } };
@@ -770,9 +770,17 @@ function classifyDel(P, N) {
   return null;
 }
 
-function makeInlineCtx(s, refs, inLink = false) {
+function makeInlineCtx(s, refs, inLink = false, state = null) {
   const masked = maskInlineString(s, refs);
-  return { s, masked, last: lastCloserIndices(masked), base: 0, refs, inLink };
+  return {
+    s,
+    masked,
+    last: lastCloserIndices(masked),
+    base: 0,
+    refs,
+    inLink,
+    state: state || { inLink: false, inRawBlock: false },
+  };
 }
 
 /** The last raw character of a text node (from the source when known). */
@@ -866,8 +874,8 @@ function tryEmStrong(nodes, i, ctx, param) {
     // depends on the following character (bare autolinks, e-mail addresses)
     // resolve against the content's end, not the outer text.
     const contentStr = s.slice(pos + uo, q + bUsed - uo);
-    const kids = scanInline(contentStr, ctx.refs, ctx.inLink);
-    processInlineMarked(kids, makeInlineCtx(contentStr, ctx.refs, ctx.inLink));
+    const kids = scanInline(contentStr, ctx.refs, ctx.inLink, ctx.state);
+    processInlineMarked(kids, makeInlineCtx(contentStr, ctx.refs, ctx.inLink, ctx.state));
     const repl = [{ k: isEm ? 'em' : 'strong', kids }];
     if (C.n > bUsed) repl.push({ k: 'delim', ch: r, n: C.n - bUsed, pos: C.pos + bUsed });
     nodes.splice(i, j - i + 1, ...repl);
@@ -911,8 +919,8 @@ function tryDel(nodes, i, ctx, param) {
     p -= o;
     if (p > 0) continue;
     const contentStr = s.slice(pos + o, q);
-    const kids = scanInline(contentStr, ctx.refs, ctx.inLink);
-    processInlineMarked(kids, makeInlineCtx(contentStr, ctx.refs, ctx.inLink));
+    const kids = scanInline(contentStr, ctx.refs, ctx.inLink, ctx.state);
+    processInlineMarked(kids, makeInlineCtx(contentStr, ctx.refs, ctx.inLink, ctx.state));
     nodes.splice(i, j - i + 1, { k: 'del', kids });
     return true;
   }
@@ -1074,11 +1082,15 @@ function renderNodes(nodes, alt = false) {
  * autolinks are suppressed and links do not form, the way the reference
  * suppresses them inside link text.
  */
-function scanInline(src, refs, inLink) {
+function scanInline(src, refs, inLink, state = { inLink: false, inRawBlock: false }) {
   const nodes = [];
   const stack = []; // indices into `nodes` of bracket openers still unmatched
-  let inRawBlock = false;
-  let inLinkTag = false;
+  // The reference threads its in-link-tag / in-raw-block state through the
+  // whole document's inline pass: an unclosed <a> or <pre> in one fragment
+  // still suppresses autolinks (or escaping) in the next. The state is
+  // seeded from, and written back to, the shared object.
+  let inRawBlock = state.inRawBlock;
+  let inLinkTag = state.inLink;
   let textBuf = '';
   const flushText = () => {
     if (textBuf.length > 0) {
@@ -1185,7 +1197,7 @@ function scanInline(src, refs, inLink) {
 
     if (ch === '!' && src[i + 1] === '[') {
       flushText();
-      const opener = { k: 'open', img: true, start: i + 2, nodeIndex: nodes.length, labelEnd: labelScanEnd(src, i + 2) };
+      const opener = { k: 'open', img: true, start: i + 2, nodeIndex: nodes.length, labelEnd: labelScanEnd(src, i + 2), snap: { inLink: inLinkTag, inRawBlock } };
       nodes.push(opener);
       stack.push(opener);
       i += 2;
@@ -1194,7 +1206,7 @@ function scanInline(src, refs, inLink) {
 
     if (ch === '[') {
       flushText();
-      const opener = { k: 'open', img: false, start: i + 1, nodeIndex: nodes.length, labelEnd: labelScanEnd(src, i + 1) };
+      const opener = { k: 'open', img: false, start: i + 1, nodeIndex: nodes.length, labelEnd: labelScanEnd(src, i + 1), snap: { inLink: inLinkTag, inRawBlock } };
       nodes.push(opener);
       stack.push(opener);
       i++;
@@ -1222,9 +1234,13 @@ function scanInline(src, refs, inLink) {
       let formed = null;
       if (!opener.dead) {
         flushText();
-        formed = tryFormLink(src, i, opener, nodes, refs, inLink);
+        formed = tryFormLink(src, i, opener, nodes, refs, inLink, state);
       }
       if (formed) {
+        // The reference parses the label with its tag state saved and
+        // restored: transitions inside the label do not leak out.
+        inLinkTag = opener.snap.inLink;
+        inRawBlock = opener.snap.inRawBlock;
         stack.pop();
         nodes.push(formed.node);
         if (!formed.node.img) {
@@ -1377,13 +1393,15 @@ function scanInline(src, refs, inLink) {
     i++;
   }
   flushText();
+  state.inLink = inLinkTag;
+  state.inRawBlock = inRawBlock;
   return nodes;
 }
 
 /** Tokenise + process an inline fragment (see scanInline). */
-function renderInline(src, refs) {
-  const nodes = scanInline(src, refs, false);
-  processInlineMarked(nodes, makeInlineCtx(src, refs));
+function renderInline(src, refs, state = { inLink: false, inRawBlock: false }) {
+  const nodes = scanInline(src, refs, false, state);
+  processInlineMarked(nodes, makeInlineCtx(src, refs, false, state));
   return renderNodes(nodes);
 }
 
@@ -2269,22 +2287,22 @@ function parseBlocks(lines, refs, top, forced) {
 
 // --- Rendering -----------------------------------------------------------------------
 
-function renderBlocks(blocks, refs, looseList = false) {
+function renderBlocks(blocks, refs, looseList = false, state = { inLink: false, inRawBlock: false }) {
   let out = '';
-  for (const b of blocks) out += renderBlock(b, refs, looseList);
+  for (const b of blocks) out += renderBlock(b, refs, looseList, state);
   return out;
 }
 
-function renderBlock(b, refs, looseList = false) {
+function renderBlock(b, refs, looseList = false, state = { inLink: false, inRawBlock: false }) {
   switch (b.t) {
     case 'para':
-      return `<p>${renderInline(b.text, refs)}</p>\n`;
+      return `<p>${renderInline(b.text, refs, state)}</p>\n`;
     case 'text':
       return looseList
-        ? `<p>${renderInline(b.text, refs)}</p>\n`
-        : renderInline(b.text, refs);
+        ? `<p>${renderInline(b.text, refs, state)}</p>\n`
+        : renderInline(b.text, refs, state);
     case 'heading':
-      return `<h${b.depth}>${renderInline(b.text, refs)}</h${b.depth}>\n`;
+      return `<h${b.depth}>${renderInline(b.text, refs, state)}</h${b.depth}>\n`;
     case 'code': {
       const body = b.text ? `${b.text.replace(/\n$/, '')}\n` : '';
       const langWord = b.lang ? b.lang.match(/^\S*/)[0] : '';
@@ -2296,13 +2314,13 @@ function renderBlock(b, refs, looseList = false) {
     case 'hr':
       return '<hr>\n';
     case 'quote':
-      return `<blockquote>\n${renderBlocks(b.kids, refs)}</blockquote>\n`;
+      return `<blockquote>\n${renderBlocks(b.kids, refs, false, state)}</blockquote>\n`;
     case 'list': {
       const tag = b.ordered ? 'ol' : 'ul';
       const startAttr = b.ordered && b.start !== 1 ? ` start="${b.start}"` : '';
       let out = `<${tag}${startAttr}>\n`;
       for (const item of b.items) {
-        let inner = renderBlocks(item.blocks, refs, b.loose);
+        let inner = renderBlocks(item.blocks, refs, b.loose, state);
         if (item.task) {
           const box = `<input ${item.checked ? 'checked="" ' : ''}disabled="" type="checkbox"> `;
           if (b.loose) {
@@ -2319,7 +2337,7 @@ function renderBlock(b, refs, looseList = false) {
       let head = '';
       for (let c = 0; c < b.header.length; c++) {
         const a = b.align[c];
-        head += `${a ? `<th align="${a}">` : '<th>'}${renderInline(b.header[c], refs)}</th>\n`;
+        head += `${a ? `<th align="${a}">` : '<th>'}${renderInline(b.header[c], refs, state)}</th>\n`;
       }
       let out = `<table>\n<thead>\n<tr>\n${head}</tr>\n</thead>\n`;
       if (b.rows.length > 0) {
@@ -2328,7 +2346,7 @@ function renderBlock(b, refs, looseList = false) {
           let cells = '';
           for (let c = 0; c < row.length; c++) {
             const a = b.align[c];
-            cells += `${a ? `<td align="${a}">` : '<td>'}${renderInline(row[c], refs)}</td>\n`;
+            cells += `${a ? `<td align="${a}">` : '<td>'}${renderInline(row[c], refs, state)}</td>\n`;
           }
           body += `<tr>\n${cells}</tr>\n`;
         }
@@ -2346,5 +2364,5 @@ export function parse(markdown) {
   const src = markdown.replace(/\r\n|\r/g, '\n');
   const refs = Object.create(null);
   const blocks = parseBlocks(src.split('\n'), refs, true);
-  return renderBlocks(blocks, refs);
+  return renderBlocks(blocks, refs, false, { inLink: false, inRawBlock: false });
 }
